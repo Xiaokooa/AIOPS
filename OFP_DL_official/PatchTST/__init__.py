@@ -1,0 +1,1 @@
+"""Official PatchTST OFP model."""

@@ -1,0 +1,1 @@
+python main.py DATA.NAME VAR_point_contextual_factor2.0 SOLVER.BASE_LR 0.001 SOLVER.WEIGHT_DECAY 0.0 SEED 2

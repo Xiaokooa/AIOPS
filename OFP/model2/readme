@@ -1,0 +1,9 @@
+CleanData.py：清洗原始数据中的特征为空的行，及对应时刻特征行。TODO: 原始数据中temp=-255的时刻可以直接检测出异常。
+SplitDataToPosNeg.py: 根据anomaly列是否有出现1，划分正负样本到不同文件夹。
+SplitSamplesToTrainTest.py：将所有样本划划定好不同数据集，以供后面交叉验证时的正负样本使用。
+TrainAndPredictResult.py：模型训练与预测。
+EvaluateResult.py：预测结果评估。
+DataAnalysis.py：数据分析和画图。多个维度统计分析的画图。
+FileData.py：其中，有单个文件画图的方法。
+FeatureExtractor.py：特征提取器代码。
+main.py：1.提取特征到csv文件。2.训练与预测。3.结果评估
