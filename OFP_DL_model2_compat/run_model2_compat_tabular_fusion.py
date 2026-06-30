@@ -26,6 +26,7 @@ from OFP_DL_model2_compat.run_model2_compat_deep import (
     CompatCfg,
     Model2FeatureCache,
     apply_threshold,
+    cap_files_stratified,
     compat_alarm_logit,
     compat_feature_names,
     compute_feature_norm_stats,
@@ -34,7 +35,11 @@ from OFP_DL_model2_compat.run_model2_compat_deep import (
     evaluate_prediction_dir_compat,
     evaluate_prediction_frames,
     file_label_map,
+    format_epoch_status,
+    format_duration,
+    log_run_header,
     parse_threshold_grid,
+    score_dataset_selected_positions,
     score_files_to_memory,
     split_train_val_files,
     train_one_epoch,
@@ -114,24 +119,60 @@ def train_deep_model(
     dataset = CompatBatchedDataset(train_files, cache, cfg)
     loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=int(cfg.num_workers))
     pos_weight = effective_pos_weight(dataset, cfg)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, dtype=torch.float32, device=cfg.device))
+    loss_fn = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor(pos_weight, dtype=torch.float32, device=cfg.device),
+        reduction="none",
+    )
     model, model_cfg, _use_special_losses = BUILDERS[model_name](int(cfg.seq_len), len(compat_feature_names(cfg)))
     model = model.to(cfg.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
     history: list[dict[str, float]] = []
-    for epoch in range(1, int(cfg.epochs) + 1):
+    adaptive_weight_meta: dict[str, float] = {}
+    adaptive_applied = False
+    total_epochs = int(cfg.epochs)
+    train_started = time.time()
+    for epoch in range(1, total_epochs + 1):
         parts = train_one_epoch(model, loader, optimizer, loss_fn, cfg, epoch)
         history.append({"epoch": float(epoch), **parts})
+        elapsed_total = time.time() - train_started
+        eta = (elapsed_total / max(epoch, 1)) * max(total_epochs - epoch, 0)
         print(
-            f"[deep-train] model={model_name} ep={epoch:02d} "
-            f"loss={parts['loss']:.5f} rows={int(parts['rows_seen'])} min={parts['elapsed_seconds']/60.0:.2f}"
+            format_epoch_status(
+                "deep-train",
+                model_name,
+                None,
+                epoch,
+                total_epochs,
+                float(parts["loss"]),
+                int(parts["rows_seen"]),
+                float(parts["elapsed_seconds"]),
+                elapsed_total,
+                eta,
+            )
         )
+        if (
+            float(cfg.adaptive_negative_weight) > 0.0
+            and not adaptive_applied
+            and epoch >= int(cfg.adaptive_warmup_epochs)
+            and epoch < int(cfg.epochs)
+        ):
+            scores_by_file = score_dataset_selected_positions(model, dataset, cache, cfg)
+            adaptive_weight_meta = dataset.apply_adaptive_negative_weights(scores_by_file, float(cfg.adaptive_negative_weight))
+            adaptive_weight_meta["applied_after_epoch"] = float(epoch)
+            adaptive_applied = True
+            print(
+                f"[adaptive-neg] rows={int(adaptive_weight_meta.get('updated_negative_rows', 0))} "
+                f"score_min={adaptive_weight_meta.get('min_score', 0.0):.5f} "
+                f"score_max={adaptive_weight_meta.get('max_score', 0.0):.5f} "
+                f"max_extra={cfg.adaptive_negative_weight}"
+            )
     train_meta = {
         "train_rows": int(dataset.total_rows),
         "train_source_rows": int(dataset.source_total_rows),
         "train_pos_rows": int(dataset.pos_rows),
         "train_neg_rows": int(dataset.neg_rows),
         "pos_weight": float(pos_weight),
+        "adaptive_negative_weight_meta": adaptive_weight_meta,
         "history": history,
     }
     del optimizer, loader
@@ -430,12 +471,20 @@ def train_ml_models(
     models: dict[str, Any] = {}
     for name in model_names:
         tag = str(name).lower()
-        estimator = build_ml_model(tag, args, y_train, seed)
+        try:
+            estimator = build_ml_model(tag, args, y_train, seed)
+        except ImportError as exc:
+            if bool(getattr(args, "require_all_ml", False)):
+                raise
+            print(f"[ml-skip] model={tag} reason=missing optional dependency: {exc}")
+            continue
         started = time.time()
         print(f"[ml-train] model={tag} rows={len(y_train)} features={x_train.shape[1]}")
         estimator.fit(x_train, y_train)
         print(f"[ml-train] model={tag} done min={(time.time() - started)/60.0:.2f}")
         models[tag] = estimator
+    if not models:
+        raise ValueError("No tabular ML models were trained; install optional dependencies or change --ml_models")
     return models
 
 
@@ -655,6 +704,12 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
         threshold_grid=args.threshold_grid,
         threshold_metric=args.threshold_metric,
         rule_mode=args.rule_mode,
+        sample_selection=args.sample_selection,
+        sample_topk_fraction=args.sample_topk_fraction,
+        temporal_positive_weight=args.temporal_positive_weight,
+        temporal_weight_horizon_hours=args.temporal_weight_horizon_hours,
+        adaptive_negative_weight=args.adaptive_negative_weight,
+        adaptive_warmup_epochs=args.adaptive_warmup_epochs,
         max_cached_files=args.max_cached_files,
         seed=args.seed,
         device=args.device,
@@ -670,19 +725,36 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
     print(f"[tabular-init] deep_model={deep_model_name} fold={fold} {runtime_device_summary(cfg.device)}")
     index_df = read_index(args.index_path)
     train_files, test_files = files_for_index_fold(index_df, int(fold))
-    if int(args.max_train_files) > 0:
-        train_files = train_files[: int(args.max_train_files)]
-    if int(args.max_test_files) > 0:
-        test_files = test_files[: int(args.max_test_files)]
     label_by_file = file_label_map(index_df)
+    if int(args.max_train_files) > 0:
+        train_files = cap_files_stratified(train_files, label_by_file, int(args.max_train_files), int(args.seed) + int(fold))
+    if int(args.max_test_files) > 0:
+        test_files = cap_files_stratified(test_files, label_by_file, int(args.max_test_files), int(args.seed) + 7919 + int(fold))
     train_files, val_files = split_train_val_files(train_files, label_by_file, cfg, int(fold))
 
     run_dir = Path(args.out_root) / deep_model_name / f"fold_{fold}"
     run_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
-    print(
-        f"[tabular-split] train={len(train_files)} val={len(val_files)} test={len(test_files)} "
-        f"target={cfg.target_mode} feature_set={args.ml_feature_set} selector={args.selector} min_hit_h={args.min_hit_lead_hours}"
+    log_run_header(
+        "OFP MODEL2-COMPAT HYBRID FUSION",
+        {
+            "deep model": deep_model_name,
+            "fold": fold,
+            "train/val/test": f"{len(train_files)}/{len(val_files)}/{len(test_files)} modules",
+            "target": cfg.target_mode,
+            "features": cfg.feature_mode,
+            "ml feature set": args.ml_feature_set,
+            "ml models": " ".join(args.ml_models),
+            "selector": f"{args.selector} top_k={args.select_k}",
+            "sample selection": cfg.sample_selection,
+            "rule mode": cfg.rule_mode,
+            "min hit lead": f"{args.min_hit_lead_hours} h",
+            "seq_len": cfg.seq_len,
+            "epochs": cfg.epochs,
+            "batch_size": cfg.batch_size,
+            "device": cfg.device,
+            "out_dir": run_dir,
+        },
     )
 
     stats = compute_feature_norm_stats(args.data_dir, train_files, cfg, label_by_file)
@@ -948,13 +1020,14 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
         )
     new.sort_values(["deep_model", "mode", "min_hit_lead_hours", "fold"], inplace=True)
     new.to_csv(path, index=False)
+    group_cols = ["deep_model", "mode", "target_mode", "feature_mode", "sampling_mode", "rule_mode", "min_hit_lead_hours"]
+    non_metric_cols = set(group_cols) | {"fold", "ml_model", "ml_feature_set", "selector"}
     numeric = [
         col
         for col in new.columns
-        if col not in {"deep_model", "mode", "ml_model", "ml_feature_set", "selector", "target_mode", "feature_mode", "sampling_mode", "rule_mode"}
-        and pd.api.types.is_numeric_dtype(new[col])
+        if col not in non_metric_cols and pd.api.types.is_numeric_dtype(new[col])
     ]
-    summary = new.groupby(["deep_model", "mode"])[numeric].agg(["mean", "std"])
+    summary = new.groupby(group_cols, dropna=False)[numeric].agg(["mean", "std"])
     summary.columns = [f"{a}_{b}" for a, b in summary.columns]
     summary.reset_index().to_csv(out_root / "model_metrics_mean_std.csv", index=False)
 
@@ -987,8 +1060,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_threshold_search", dest="threshold_search", action="store_false")
     parser.set_defaults(threshold_search=True)
     parser.add_argument("--rule_mode", choices=["none", "temp", "model2_simple"], default="model2_simple")
+    parser.add_argument("--sample_selection", choices=["random", "signal_topk", "hybrid"], default="random")
+    parser.add_argument("--sample_topk_fraction", type=float, default=0.5)
+    parser.add_argument("--temporal_positive_weight", type=float, default=0.0)
+    parser.add_argument("--temporal_weight_horizon_hours", type=float, default=120.0)
+    parser.add_argument("--adaptive_negative_weight", type=float, default=0.0)
+    parser.add_argument("--adaptive_warmup_epochs", type=int, default=1)
     parser.add_argument("--min_hit_lead_hours", type=float, default=0.0)
-    parser.add_argument("--ml_models", nargs="+", default=["rf", "xgb", "xgbrf"])
+    parser.add_argument("--ml_models", nargs="+", default=["rf", "xgb", "lgbm", "catboost"])
+    parser.add_argument("--require_all_ml", action="store_true")
     parser.add_argument("--ml_feature_set", choices=["model2", "embedding", "fusion"], default="fusion")
     parser.add_argument("--deep_feature_parts", default="embedding,score")
     parser.add_argument("--selector", choices=["none", "variance", "f_classif", "mutual_info", "extra_trees", "model_importance"], default="extra_trees")

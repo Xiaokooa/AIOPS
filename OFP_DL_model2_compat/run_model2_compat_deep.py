@@ -75,6 +75,12 @@ class CompatCfg:
     threshold_grid: str = "0.001,0.003,0.005,0.01,0.02,0.03,0.05,0.07,0.10,0.15,0.20,0.25,0.30,0.40,0.50"
     threshold_metric: str = "f1_score"
     rule_mode: str = "model2_simple"
+    sample_selection: str = "random"
+    sample_topk_fraction: float = 0.5
+    temporal_positive_weight: float = 0.0
+    temporal_weight_horizon_hours: float = 120.0
+    adaptive_negative_weight: float = 0.0
+    adaptive_warmup_epochs: int = 1
     max_cached_files: int = 512
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -118,7 +124,7 @@ ROLLING_BASE_COLS = [
     "FeRxP0-Max",
     "FeRxP0-Min",
 ]
-ROLL_WINDOWS = (3, 6, 12)
+ROLL_WINDOWS = (3, 6, 12, 24, 64)
 LANE_PLUS_FEATURES = [
     "TxLaneRange",
     "RxLaneRange",
@@ -139,7 +145,28 @@ for _col in ROLLING_BASE_COLS:
                 f"{_col}_r{_win}_delta",
             ]
         )
-COMPAT_PLUS_FEATURES = list(MODEL2_FEATURES) + LANE_PLUS_FEATURES + ROLLING_PLUS_FEATURES
+DRAM_PLUS_FEATURES = [
+    "DeltaSeconds",
+    "ElapsedHours",
+    "TempInvalidFlag",
+    "CurrLowFlag",
+    "TxNegativeCount",
+    "RxNegativeCount",
+    "PowerNegativeCount",
+    "PowerHighCount",
+    "RuleLikeAbnormalCount",
+    "AnyRuleLikeAbnormal",
+]
+for _win in ROLL_WINDOWS:
+    DRAM_PLUS_FEATURES.extend(
+        [
+            f"RuleLikeStorm_r{_win}",
+            f"RuleLikeRate_r{_win}",
+            f"PowerNegStorm_r{_win}",
+            f"PowerHighStorm_r{_win}",
+        ]
+    )
+COMPAT_PLUS_FEATURES = list(MODEL2_FEATURES) + LANE_PLUS_FEATURES + ROLLING_PLUS_FEATURES + DRAM_PLUS_FEATURES
 
 
 def compat_feature_names(cfg: CompatCfg) -> list[str]:
@@ -173,6 +200,40 @@ def add_model2_plus_features(frame: pd.DataFrame) -> pd.DataFrame:
         extras["RxLaneRange"] = 0.0
         extras["RxLaneStd"] = 0.0
         extras["RxP0MinusLaneMean"] = 0.0
+
+    ts = pd.to_numeric(out.get("Ts", pd.Series(np.arange(len(out)), index=out.index)), errors="coerce").ffill().fillna(0.0)
+    extras["DeltaSeconds"] = ts.diff().fillna(0.0).clip(lower=0.0)
+    extras["ElapsedHours"] = ((ts - ts.iloc[0]) / 3600.0).fillna(0.0) if len(ts) else 0.0
+    temp = pd.to_numeric(out.get("Temp", 0.0), errors="coerce").fillna(NA_DEFAULT)
+    curr = pd.to_numeric(out.get("Curr", 0.0), errors="coerce").fillna(NA_DEFAULT)
+    extras["TempInvalidFlag"] = temp.le(-254.0).astype(float)
+    extras["CurrLowFlag"] = curr.lt(5000.0).astype(float)
+
+    tx_all_cols = ["TxP0", "TxP1", "TxP2", "TxP3", "TxP4"]
+    rx_all_cols = ["RxP0", "RxP1", "RxP2", "RxP3", "RxP4"]
+    tx_all = out[[c for c in tx_all_cols if c in out.columns]].apply(pd.to_numeric, errors="coerce")
+    rx_all = out[[c for c in rx_all_cols if c in out.columns]].apply(pd.to_numeric, errors="coerce")
+    tx_neg = tx_all.lt(0.0).sum(axis=1) if len(tx_all.columns) else pd.Series(0.0, index=out.index)
+    rx_neg = rx_all.lt(0.0).sum(axis=1) if len(rx_all.columns) else pd.Series(0.0, index=out.index)
+    tx_high = tx_all.gt(1000.0).sum(axis=1) if len(tx_all.columns) else pd.Series(0.0, index=out.index)
+    rx_high = rx_all.gt(1000.0).sum(axis=1) if len(rx_all.columns) else pd.Series(0.0, index=out.index)
+    power_neg = tx_neg + rx_neg
+    power_high = tx_high + rx_high
+    rule_like = extras["TempInvalidFlag"] + extras["CurrLowFlag"] + power_neg + power_high
+    extras["TxNegativeCount"] = tx_neg.astype(float)
+    extras["RxNegativeCount"] = rx_neg.astype(float)
+    extras["PowerNegativeCount"] = power_neg.astype(float)
+    extras["PowerHighCount"] = power_high.astype(float)
+    extras["RuleLikeAbnormalCount"] = rule_like.astype(float)
+    extras["AnyRuleLikeAbnormal"] = pd.Series(rule_like, index=out.index).gt(0).astype(float)
+    for win in ROLL_WINDOWS:
+        abnormal_roll = pd.Series(rule_like, index=out.index).rolling(window=win, min_periods=1)
+        power_neg_roll = pd.Series(power_neg, index=out.index).rolling(window=win, min_periods=1)
+        power_high_roll = pd.Series(power_high, index=out.index).rolling(window=win, min_periods=1)
+        extras[f"RuleLikeStorm_r{win}"] = abnormal_roll.sum().fillna(0.0)
+        extras[f"RuleLikeRate_r{win}"] = abnormal_roll.mean().fillna(0.0)
+        extras[f"PowerNegStorm_r{win}"] = power_neg_roll.sum().fillna(0.0)
+        extras[f"PowerHighStorm_r{win}"] = power_high_roll.sum().fillna(0.0)
 
     for col in ROLLING_BASE_COLS:
         series = pd.to_numeric(out[col], errors="coerce") if col in out.columns else pd.Series(0.0, index=out.index)
@@ -357,6 +418,77 @@ class Model2FeatureCache:
         return item
 
 
+def row_signal_scores(features: np.ndarray, rule_pred: np.ndarray) -> np.ndarray:
+    if len(features) == 0:
+        return np.zeros(0, dtype=np.float32)
+    finite = np.nan_to_num(features.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    score = np.mean(np.abs(finite), axis=1)
+    if len(rule_pred) == len(score):
+        score = score + 5.0 * np.asarray(rule_pred, dtype=np.float32)
+    return np.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+def choose_positions_by_signal(
+    positions: np.ndarray,
+    n_take: int,
+    scores: np.ndarray,
+    cfg: CompatCfg,
+    seed: int,
+) -> np.ndarray:
+    positions = np.asarray(positions, dtype=np.int64)
+    n_take = int(n_take)
+    if n_take <= 0 or len(positions) == 0:
+        return np.empty(0, dtype=np.int64)
+    if n_take >= len(positions):
+        return np.sort(positions).astype(np.int64)
+
+    mode = str(cfg.sample_selection).lower()
+    rng = np.random.default_rng(int(seed))
+    if mode in {"random", "uniform"}:
+        return np.sort(rng.choice(positions, size=n_take, replace=False)).astype(np.int64)
+
+    pos_scores = np.asarray(scores[positions], dtype=np.float32)
+    order = np.argsort(pos_scores)[::-1]
+    if mode in {"signal_topk", "topk", "hard"}:
+        return np.sort(positions[order[:n_take]]).astype(np.int64)
+    if mode in {"hybrid", "topk_random"}:
+        n_top = int(round(float(n_take) * float(cfg.sample_topk_fraction)))
+        n_top = min(max(1, n_top), n_take)
+        top = positions[order[:n_top]]
+        if n_top >= n_take:
+            return np.sort(top).astype(np.int64)
+        rest = positions[order[n_top:]]
+        n_random = n_take - n_top
+        if len(rest) <= n_random:
+            chosen = np.concatenate([top, rest])
+        else:
+            chosen = np.concatenate([top, rng.choice(rest, size=n_random, replace=False)])
+        return np.sort(chosen).astype(np.int64)
+    raise ValueError(f"Unknown sample_selection={cfg.sample_selection!r}; use random, signal_topk, or hybrid")
+
+
+def temporal_position_weights(
+    timestamps: np.ndarray,
+    labels: np.ndarray,
+    anomaly_labels: np.ndarray,
+    positions: np.ndarray,
+    cfg: CompatCfg,
+) -> np.ndarray:
+    weights = np.ones(len(positions), dtype=np.float32)
+    max_extra = float(cfg.temporal_positive_weight)
+    if max_extra <= 0.0 or len(positions) == 0:
+        return weights
+    pos_mask = labels[positions] > 0
+    if not np.any(pos_mask) or not np.any(anomaly_labels > 0):
+        return weights
+    first_ts = float(timestamps[np.flatnonzero(anomaly_labels > 0)[0]])
+    horizon = max(float(cfg.temporal_weight_horizon_hours), 1e-6)
+    lead_hours = (first_ts - timestamps[positions].astype(float)) / 3600.0
+    proximity = np.where(lead_hours >= 0.0, 1.0 - np.clip(lead_hours / horizon, 0.0, 1.0), 1.0)
+    weights[pos_mask] += (max_extra * proximity[pos_mask]).astype(np.float32)
+    return weights.astype(np.float32)
+
+
 class CompatBatchedDataset(IterableDataset):
     def __init__(
         self,
@@ -369,6 +501,8 @@ class CompatBatchedDataset(IterableDataset):
         self.cfg = cfg
         self.feature_names = compat_feature_names(cfg)
         self.selected_positions: list[np.ndarray] = []
+        self.selected_labels: list[np.ndarray] = []
+        self.selected_weights: list[np.ndarray] = []
         self.source_total_rows = 0
         self.source_pos_rows = 0
         self.source_neg_rows = 0
@@ -411,20 +545,34 @@ class CompatBatchedDataset(IterableDataset):
         self.total_batches = 0
 
         for name, pos, neg, n_neg in zip(self.file_names, pos_positions, neg_positions, alloc):
+            timestamps, features, _valid_mask, labels, anomaly_labels, rule_pred, _extra = self.cache.get(name)
+            signal_scores = row_signal_scores(features, rule_pred)
             if sampling_mode in {"module_balanced", "module"} and len(pos) > int(cfg.positive_windows_per_module) > 0:
                 stable = zlib.crc32((name + "::pos").encode("utf-8")) & 0xFFFFFFFF
-                rng_pos = np.random.default_rng(int(cfg.seed) + int(stable))
-                pos = np.sort(rng_pos.choice(pos, size=int(cfg.positive_windows_per_module), replace=False)).astype(np.int64)
+                pos = choose_positions_by_signal(
+                    pos,
+                    int(cfg.positive_windows_per_module),
+                    signal_scores,
+                    cfg,
+                    int(cfg.seed) + int(stable),
+                )
             if int(n_neg) >= len(neg):
                 chosen_neg = neg
             elif int(n_neg) > 0:
                 stable = zlib.crc32(name.encode("utf-8")) & 0xFFFFFFFF
-                rng = np.random.default_rng(int(cfg.seed) + int(stable))
-                chosen_neg = np.sort(rng.choice(neg, size=int(n_neg), replace=False)).astype(np.int64)
+                chosen_neg = choose_positions_by_signal(
+                    neg,
+                    int(n_neg),
+                    signal_scores,
+                    cfg,
+                    int(cfg.seed) + int(stable),
+                )
             else:
                 chosen_neg = np.empty(0, dtype=np.int64)
             selected = np.sort(np.concatenate([pos, chosen_neg])).astype(np.int64)
             self.selected_positions.append(selected)
+            self.selected_labels.append(labels[selected].astype(np.int8))
+            self.selected_weights.append(temporal_position_weights(timestamps, labels, anomaly_labels, selected, cfg))
             self.pos_rows += int(len(pos))
             self.total_batches += int(math.ceil(len(selected) / max(1, int(cfg.batch_size)))) if len(selected) else 0
         self.total_rows = int(self.pos_rows + self.neg_rows)
@@ -435,11 +583,41 @@ class CompatBatchedDataset(IterableDataset):
             f"sampled_rows={self.total_rows} sampled_pos={self.pos_rows} sampled_neg={self.neg_rows} "
             f"sampling={cfg.sampling_mode} negative_ratio={cfg.negative_ratio} "
             f"per_module pos={cfg.positive_windows_per_module} faulty_neg={cfg.negative_windows_per_faulty_module} "
-            f"normal_neg={cfg.normal_windows_per_module} features={len(self.feature_names)} batches={self.total_batches}"
+            f"normal_neg={cfg.normal_windows_per_module} selection={cfg.sample_selection} "
+            f"temporal_pos_w={cfg.temporal_positive_weight} features={len(self.feature_names)} batches={self.total_batches}"
         )
 
     def __len__(self) -> int:
         return int(self.total_batches)
+
+    def apply_adaptive_negative_weights(self, scores_by_file: dict[str, np.ndarray], max_extra: float) -> dict[str, float]:
+        max_extra = float(max_extra)
+        if max_extra <= 0.0:
+            return {"updated_negative_rows": 0.0, "min_score": 0.0, "max_score": 0.0}
+        neg_scores: list[np.ndarray] = []
+        for name, labels, _weights in zip(self.file_names, self.selected_labels, self.selected_weights):
+            scores = np.asarray(scores_by_file.get(name, np.zeros(len(labels), dtype=np.float32)), dtype=np.float32)
+            if len(scores) != len(labels):
+                continue
+            neg_scores.append(scores[labels <= 0])
+        all_neg = np.concatenate([x for x in neg_scores if len(x)]) if any(len(x) for x in neg_scores) else np.zeros(0, dtype=np.float32)
+        if len(all_neg) == 0:
+            return {"updated_negative_rows": 0.0, "min_score": 0.0, "max_score": 0.0}
+        lo = float(np.nanmin(all_neg))
+        hi = float(np.nanmax(all_neg))
+        denom = max(hi - lo, 1e-8)
+        updated = 0
+        for idx, (name, labels, weights) in enumerate(zip(self.file_names, self.selected_labels, self.selected_weights)):
+            scores = np.asarray(scores_by_file.get(name, np.zeros(len(labels), dtype=np.float32)), dtype=np.float32)
+            if len(scores) != len(labels):
+                continue
+            neg_mask = labels <= 0
+            scaled = np.clip((scores - lo) / denom, 0.0, 1.0).astype(np.float32)
+            weights = weights.copy()
+            weights[neg_mask] = 1.0 + max_extra * scaled[neg_mask]
+            self.selected_weights[idx] = weights.astype(np.float32)
+            updated += int(np.sum(neg_mask))
+        return {"updated_negative_rows": float(updated), "min_score": lo, "max_score": hi}
 
     def __iter__(self):
         seq_len = int(self.cfg.seq_len)
@@ -449,10 +627,12 @@ class CompatBatchedDataset(IterableDataset):
         worker = get_worker_info()
         if worker is not None:
             pairs = pairs[worker.id :: worker.num_workers]
+        weight_by_name = {name: weights for name, weights in zip(self.file_names, self.selected_weights)}
         for name, selected in pairs:
             if len(selected) <= 0:
                 continue
             _ts, features, _valid_mask, labels, _anomaly_labels, _rule_pred, _extra = self.cache.get(name)
+            selected_weights = weight_by_name.get(name, np.ones(len(selected), dtype=np.float32))
             pad_x = np.zeros((seq_len - 1, n_features), dtype=np.float32)
             pad_m = np.zeros_like(pad_x)
             x_pad = torch.from_numpy(np.concatenate([pad_x, features.astype(np.float32)], axis=0))
@@ -467,6 +647,7 @@ class CompatBatchedDataset(IterableDataset):
                     x_windows.index_select(0, idx).contiguous(),
                     m_windows.index_select(0, idx).contiguous(),
                     ys[start:end].contiguous(),
+                    torch.from_numpy(selected_weights[start:end].astype(np.float32)).contiguous(),
                 )
 
 
@@ -474,6 +655,63 @@ def cuda_autocast(enabled: bool):
     if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
         return torch.amp.autocast("cuda", enabled=bool(enabled))
     return torch.cuda.amp.autocast(enabled=bool(enabled))
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(float(seconds), 0.0)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    if hours > 0:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes > 0:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def format_rate(rows: float, seconds: float) -> str:
+    if float(seconds) <= 0.0:
+        return "0.0 rows/s"
+    return f"{float(rows) / max(float(seconds), 1e-9):.1f} rows/s"
+
+
+def progress_bar(current: int, total: int, width: int = 24) -> str:
+    total = max(int(total), 1)
+    current = min(max(int(current), 0), total)
+    filled = int(round(width * current / total))
+    return "[" + "#" * filled + "-" * (width - filled) + f"] {100.0 * current / total:5.1f}%"
+
+
+def log_run_header(title: str, fields: dict[str, object]) -> None:
+    line = "=" * 88
+    print(line)
+    print(f"{title}")
+    print("-" * 88)
+    for key, value in fields.items():
+        print(f"{key:>22}: {value}")
+    print(line)
+
+
+def format_epoch_status(
+    tag: str,
+    model_name: str,
+    fold: int | None,
+    epoch: int,
+    total_epochs: int,
+    loss: float,
+    rows: int,
+    epoch_seconds: float,
+    elapsed_seconds: float,
+    eta_seconds: float,
+) -> str:
+    fold_text = f" fold={fold}" if fold is not None else ""
+    return (
+        f"[{tag}] model={model_name}{fold_text} ep={epoch:02d}/{total_epochs:02d} "
+        f"{progress_bar(epoch, total_epochs, width=18)} "
+        f"loss={loss:.5f} rows={rows} rate={format_rate(rows, epoch_seconds)} "
+        f"epoch={format_duration(epoch_seconds)} elapsed={format_duration(elapsed_seconds)} "
+        f"eta={format_duration(eta_seconds)}"
+    )
 
 
 def compat_alarm_logit(outputs: torch.Tensor | tuple) -> torch.Tensor:
@@ -497,15 +735,22 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer, loss_fn, cf
     n_seen = 0
     started = time.time()
     amp_enabled = bool(cfg.amp) and str(cfg.device).startswith("cuda")
-    for batch_idx, (xs, masks, ys) in enumerate(loader, 1):
+    for batch_idx, batch in enumerate(loader, 1):
+        if len(batch) == 3:
+            xs, masks, ys = batch
+            ws = torch.ones_like(ys, dtype=torch.float32)
+        else:
+            xs, masks, ys, ws = batch
         xs = xs.to(cfg.device, non_blocking=True)
         masks = masks.to(cfg.device, non_blocking=True)
         ys = ys.to(cfg.device, non_blocking=True).float()
+        ws = ws.to(cfg.device, non_blocking=True).float()
         optimizer.zero_grad(set_to_none=True)
         with cuda_autocast(amp_enabled):
             outputs = model(xs, masks)
             alarm_logits = compat_alarm_logit(outputs)
-            loss = loss_fn(alarm_logits, ys)
+            loss_raw = loss_fn(alarm_logits, ys)
+            loss = (loss_raw * ws).sum() / torch.clamp(ws.sum(), min=1.0)
         if not torch.isfinite(loss):
             raise FloatingPointError(f"non-finite loss at epoch={epoch} batch={batch_idx}")
         loss.backward()
@@ -518,12 +763,54 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer, loss_fn, cf
         total_loss += float(loss.detach().cpu()) * batch_n
         n_seen += batch_n
         if int(cfg.log_batches) > 0 and batch_idx % int(cfg.log_batches) == 0:
-            print(f"[train] ep={epoch:02d} batch={batch_idx}/{len(loader)} loss={total_loss / max(n_seen, 1):.5f}")
+            elapsed = time.time() - started
+            print(
+                f"[batch] ep={epoch:02d} batch={batch_idx:>5}/{len(loader):<5} "
+                f"{progress_bar(batch_idx, len(loader), width=16)} "
+                f"loss={total_loss / max(n_seen, 1):.5f} rows={n_seen} "
+                f"rate={format_rate(n_seen, elapsed)} elapsed={format_duration(elapsed)}"
+            )
     return {
         "loss": total_loss / max(n_seen, 1),
         "rows_seen": float(n_seen),
         "elapsed_seconds": float(time.time() - started),
     }
+
+
+@torch.no_grad()
+def score_dataset_selected_positions(
+    model: nn.Module,
+    dataset: CompatBatchedDataset,
+    cache: Model2FeatureCache,
+    cfg: CompatCfg,
+) -> dict[str, np.ndarray]:
+    model.eval()
+    seq_len = int(cfg.seq_len)
+    n_features = len(compat_feature_names(cfg))
+    amp_enabled = bool(cfg.amp) and str(cfg.device).startswith("cuda")
+    scores_by_file: dict[str, np.ndarray] = {}
+    for file_name, selected in zip(dataset.file_names, dataset.selected_positions):
+        if len(selected) == 0:
+            scores_by_file[file_name] = np.zeros(0, dtype=np.float32)
+            continue
+        _timestamps, features, _valid_mask, _labels, _anomaly_labels, _rule_pred, _extra = cache.get(file_name)
+        pad_x = np.zeros((seq_len - 1, n_features), dtype=np.float32)
+        pad_m = np.zeros_like(pad_x)
+        x_pad = torch.from_numpy(np.concatenate([pad_x, features.astype(np.float32)], axis=0))
+        m_pad = torch.from_numpy(np.concatenate([pad_m, np.ones_like(features, dtype=np.float32)], axis=0))
+        x_windows = x_pad.unfold(0, seq_len, 1).permute(0, 2, 1)
+        m_windows = m_pad.unfold(0, seq_len, 1).permute(0, 2, 1)
+        parts: list[np.ndarray] = []
+        for start in range(0, len(selected), int(cfg.batch_size)):
+            idx = torch.from_numpy(selected[start : start + int(cfg.batch_size)])
+            xb = x_windows.index_select(0, idx).contiguous().to(cfg.device)
+            mb = m_windows.index_select(0, idx).contiguous().to(cfg.device)
+            with cuda_autocast(amp_enabled):
+                outputs = model(xb, mb)
+                alarm_logits = compat_alarm_logit(outputs)
+            parts.append(torch.sigmoid(alarm_logits).float().detach().cpu().numpy().reshape(-1))
+        scores_by_file[file_name] = np.concatenate(parts).astype(np.float32) if parts else np.zeros(0, dtype=np.float32)
+    return scores_by_file
 
 
 @torch.no_grad()
@@ -608,6 +895,48 @@ def file_label_map(index_df: pd.DataFrame) -> dict[str, int]:
         str(row["file_name"]): int(row["Label"])
         for _, row in index_df[["file_name", "Label"]].drop_duplicates("file_name").iterrows()
     }
+
+
+def cap_files_stratified(
+    file_names: list[str],
+    label_by_file: dict[str, int],
+    max_files: int,
+    seed: int,
+) -> list[str]:
+    if int(max_files) <= 0 or len(file_names) <= int(max_files):
+        return list(file_names)
+    original_order = {name: idx for idx, name in enumerate(file_names)}
+    groups: dict[int, list[str]] = {}
+    for name in file_names:
+        groups.setdefault(int(label_by_file.get(name, 0)), []).append(name)
+    labels = sorted(groups)
+    counts = np.asarray([len(groups[label]) for label in labels], dtype=float)
+    raw = counts / max(float(counts.sum()), 1.0) * float(max_files)
+    alloc = np.floor(raw).astype(int)
+    if int(max_files) >= len(labels):
+        for idx, label in enumerate(labels):
+            if len(groups[label]) > 0 and alloc[idx] == 0:
+                alloc[idx] = 1
+    while int(alloc.sum()) > int(max_files):
+        idx = int(np.argmax(alloc))
+        alloc[idx] -= 1
+    remainder = int(max_files) - int(alloc.sum())
+    if remainder > 0:
+        order = np.argsort(raw - np.floor(raw))[::-1]
+        for idx in order:
+            if remainder <= 0:
+                break
+            room = len(groups[labels[int(idx)]]) - int(alloc[int(idx)])
+            if room > 0:
+                alloc[int(idx)] += 1
+                remainder -= 1
+    rng = np.random.default_rng(int(seed))
+    selected: list[str] = []
+    for label, n_take in zip(labels, alloc):
+        group = np.asarray(groups[label], dtype=object)
+        rng.shuffle(group)
+        selected.extend(str(x) for x in group[: int(n_take)])
+    return sorted(selected, key=lambda name: original_order.get(name, len(original_order)))
 
 
 def split_train_val_files(
@@ -896,18 +1225,32 @@ def run_fold(model_name: str, model_builder: ModelBuilder, fold: int, data_dir: 
             pass
     print(f"[compat-init] model={model_name} fold={fold} {runtime_device_summary(cfg.device)}")
     train_files, test_files = files_for_index_fold(index_df, int(fold))
-    if int(cfg.max_train_files) > 0:
-        train_files = train_files[: int(cfg.max_train_files)]
-    if int(cfg.max_test_files) > 0:
-        test_files = test_files[: int(cfg.max_test_files)]
     label_by_file = file_label_map(index_df)
+    if int(cfg.max_train_files) > 0:
+        train_files = cap_files_stratified(train_files, label_by_file, int(cfg.max_train_files), int(cfg.seed) + int(fold))
+    if int(cfg.max_test_files) > 0:
+        test_files = cap_files_stratified(test_files, label_by_file, int(cfg.max_test_files), int(cfg.seed) + 7919 + int(fold))
     train_files, val_files = split_train_val_files(train_files, label_by_file, cfg, int(fold))
     run_dir = Path(out_root) / model_name / f"fold_{fold}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    print(
-        f"[compat-split] train={len(train_files)} val={len(val_files)} test={len(test_files)} "
-        f"target={cfg.target_mode} feature_mode={cfg.feature_mode} sampling={cfg.sampling_mode} rule={cfg.rule_mode}"
+    log_run_header(
+        "OFP MODEL2-COMPAT DEEP TRAIN",
+        {
+            "model": model_name,
+            "fold": fold,
+            "train/val/test": f"{len(train_files)}/{len(val_files)}/{len(test_files)} modules",
+            "target": cfg.target_mode,
+            "features": cfg.feature_mode,
+            "sampling": cfg.sampling_mode,
+            "sample selection": cfg.sample_selection,
+            "rule mode": cfg.rule_mode,
+            "seq_len": cfg.seq_len,
+            "epochs": cfg.epochs,
+            "batch_size": cfg.batch_size,
+            "device": cfg.device,
+            "out_dir": run_dir,
+        },
     )
     stats = compute_feature_norm_stats(data_dir, train_files, cfg, label_by_file)
     mean, std = stats.arrays()
@@ -915,19 +1258,53 @@ def run_fold(model_name: str, model_builder: ModelBuilder, fold: int, data_dir: 
     dataset = CompatBatchedDataset(train_files, cache, cfg)
     loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=int(cfg.num_workers))
     pos_weight = effective_pos_weight(dataset, cfg)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, dtype=torch.float32, device=cfg.device))
+    loss_fn = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor(pos_weight, dtype=torch.float32, device=cfg.device),
+        reduction="none",
+    )
     model, model_cfg, _use_special_losses = model_builder(int(cfg.seq_len), len(compat_feature_names(cfg)))
     model = model.to(cfg.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
     history: list[dict] = []
+    adaptive_weight_meta: dict[str, float] = {}
+    adaptive_applied = False
     t0 = time.time()
-    for epoch in range(1, int(cfg.epochs) + 1):
+    total_epochs = int(cfg.epochs)
+    for epoch in range(1, total_epochs + 1):
         parts = train_one_epoch(model, loader, optimizer, loss_fn, cfg, epoch)
         history.append({"epoch": epoch, **parts})
+        elapsed_total = time.time() - t0
+        eta = (elapsed_total / max(epoch, 1)) * max(total_epochs - epoch, 0)
         print(
-            f"[compat-train] model={model_name} fold={fold} ep={epoch:02d} "
-            f"loss={parts['loss']:.5f} rows={int(parts['rows_seen'])} min={parts['elapsed_seconds']/60.0:.2f}"
+            format_epoch_status(
+                "compat-train",
+                model_name,
+                int(fold),
+                epoch,
+                total_epochs,
+                float(parts["loss"]),
+                int(parts["rows_seen"]),
+                float(parts["elapsed_seconds"]),
+                elapsed_total,
+                eta,
+            )
         )
+        if (
+            float(cfg.adaptive_negative_weight) > 0.0
+            and not adaptive_applied
+            and epoch >= int(cfg.adaptive_warmup_epochs)
+            and epoch < int(cfg.epochs)
+        ):
+            scores_by_file = score_dataset_selected_positions(model, dataset, cache, cfg)
+            adaptive_weight_meta = dataset.apply_adaptive_negative_weights(scores_by_file, float(cfg.adaptive_negative_weight))
+            adaptive_weight_meta["applied_after_epoch"] = float(epoch)
+            adaptive_applied = True
+            print(
+                f"[adaptive-neg] rows={int(adaptive_weight_meta.get('updated_negative_rows', 0))} "
+                f"score_min={adaptive_weight_meta.get('min_score', 0.0):.5f} "
+                f"score_max={adaptive_weight_meta.get('max_score', 0.0):.5f} "
+                f"max_extra={cfg.adaptive_negative_weight}"
+            )
 
     selected_threshold, val_metrics = select_threshold(model, cache, val_files, data_dir, run_dir, cfg)
 
@@ -968,6 +1345,7 @@ def run_fold(model_name: str, model_builder: ModelBuilder, fold: int, data_dir: 
         "val_metrics": val_metrics,
         "pos_weight": float(pos_weight),
         "pos_weight_cap": float(cfg.pos_weight_cap),
+        "adaptive_negative_weight_meta": adaptive_weight_meta,
         "min_hit_lead_hours": float(cfg.min_hit_lead_hours),
         "seconds": time.time() - t0,
         "metrics": metrics,
@@ -1027,12 +1405,14 @@ def aggregate_results(results: list[dict], out_root: Path) -> None:
         )
     new.sort_values(["model", "target_mode", "feature_mode", "sampling_mode", "rule_mode", "min_hit_lead_hours", "fold"], inplace=True)
     new.to_csv(path, index=False)
+    group_cols = ["model", "target_mode", "feature_mode", "sampling_mode", "rule_mode", "min_hit_lead_hours"]
+    non_metric_cols = set(group_cols) | {"fold"}
     numeric = [
         c
         for c in new.columns
-        if c not in {"model", "fold", "target_mode", "feature_mode", "sampling_mode", "rule_mode"} and pd.api.types.is_numeric_dtype(new[c])
+        if c not in non_metric_cols and pd.api.types.is_numeric_dtype(new[c])
     ]
-    summary = new.groupby("model")[numeric].agg(["mean", "std"])
+    summary = new.groupby(group_cols, dropna=False)[numeric].agg(["mean", "std"])
     summary.columns = [f"{a}_{b}" for a, b in summary.columns]
     summary.reset_index().to_csv(out_root / "model_metrics_mean_std.csv", index=False)
 
@@ -1063,6 +1443,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold_grid", default="0.001,0.003,0.005,0.01,0.02,0.03,0.05,0.07,0.10,0.15,0.20,0.25,0.30,0.40,0.50")
     parser.add_argument("--threshold_metric", default="f1_score")
     parser.add_argument("--rule_mode", choices=["none", "temp", "model2_simple"], default="model2_simple")
+    parser.add_argument("--sample_selection", choices=["random", "signal_topk", "hybrid"], default="random")
+    parser.add_argument("--sample_topk_fraction", type=float, default=0.5)
+    parser.add_argument("--temporal_positive_weight", type=float, default=0.0)
+    parser.add_argument("--temporal_weight_horizon_hours", type=float, default=120.0)
+    parser.add_argument("--adaptive_negative_weight", type=float, default=0.0)
+    parser.add_argument("--adaptive_warmup_epochs", type=int, default=1)
     parser.add_argument("--no_threshold_search", action="store_true")
     parser.add_argument("--max_cached_files", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
@@ -1107,6 +1493,12 @@ def main() -> None:
         threshold_grid=args.threshold_grid,
         threshold_metric=args.threshold_metric,
         rule_mode=args.rule_mode,
+        sample_selection=args.sample_selection,
+        sample_topk_fraction=args.sample_topk_fraction,
+        temporal_positive_weight=args.temporal_positive_weight,
+        temporal_weight_horizon_hours=args.temporal_weight_horizon_hours,
+        adaptive_negative_weight=args.adaptive_negative_weight,
+        adaptive_warmup_epochs=args.adaptive_warmup_epochs,
         max_cached_files=args.max_cached_files,
         seed=args.seed,
         device=args.device,

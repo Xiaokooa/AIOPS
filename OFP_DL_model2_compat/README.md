@@ -78,12 +78,91 @@ To evaluate the stricter "at least 1 hour before the first anomaly" hit rule:
 MIN_HIT_LEAD_HOURS=1 GPU_ID=0 bash OFP_DL_model2_compat/scripts/run_model2_compat_suite.sh
 ```
 
+## Paper-Oriented Three-Protocol Suite
+
+For paper tables, prefer the Python suite below because it keeps the three
+protocols in separate output folders and uses full data by default:
+
+```bash
+python -B OFP_DL_model2_compat/run_paper_suite.py --profile formal
+```
+
+The default models are exactly the four requested backbones:
+
+```text
+fits itransformer moderntcn patchtst
+```
+
+Methods:
+
+- `pure_deep`: deep backbone only, no rule OR and no tabular ML. Default target
+  is `ahead120`, so this is the strict first-warning diagnostic adapter.
+- `ofp_compat_deep`: direct deep row classifier with `module_fault`,
+  `model2_plus`, and `model2_simple` rule OR. This is the main
+  model2-compatible deep adapter.
+- `hybrid_fusion`: trains the deep backbone, extracts final-layer embeddings and
+  deep scores, concatenates them with model2/model2_plus features, then trains
+  RF/XGB/LightGBM/CatBoost tabular models. Default ML models are
+  `rf,xgb,lgbm,catboost`; missing optional dependencies are skipped unless
+  `--require_all_ml` is set.
+
+The paper suite enables DRAM-inspired training defaults:
+
+- `--sample_selection hybrid`: half high-signal top-k rows and half random rows,
+  following the "high-quality sample selection" idea.
+- `--temporal_positive_weight 2`: upweights positive rows closer to the first
+  anomaly within `--temporal_weight_horizon_hours 120`.
+- `--adaptive_negative_weight 1`: after a warmup epoch, scores selected negative
+  rows and upweights harder negatives for the remaining epochs.
+- `model2_plus` includes multi-scale rule-like storm/count/rate features over
+  short and long windows.
+
+Before a long run, print the exact commands:
+
+```bash
+python -B OFP_DL_model2_compat/run_paper_suite.py --profile formal --dry_run
+```
+
+Quick smoke test:
+
+```bash
+python -B OFP_DL_model2_compat/run_paper_suite.py --profile smoke --methods all --device cpu
+```
+
+Useful formal variants:
+
+```bash
+# Isolate hybrid fusion without explicit rule OR.
+python -B OFP_DL_model2_compat/run_paper_suite.py --profile formal --methods hybrid_fusion --hybrid_rule_mode none
+
+# Evaluate a stricter hit definition requiring at least one hour lead time.
+python -B OFP_DL_model2_compat/run_paper_suite.py --profile formal --min_hit_lead_hours 1
+
+# Lead-time sensitivity table for operational constraints.
+python -B OFP_DL_model2_compat/run_paper_suite.py --profile formal --min_hit_lead_hours 2
+python -B OFP_DL_model2_compat/run_paper_suite.py --profile formal --min_hit_lead_hours 5
+
+# Fail instead of skipping if LightGBM/CatBoost are missing.
+python -B OFP_DL_model2_compat/run_paper_suite.py --profile formal --methods hybrid_fusion --require_all_ml
+```
+
+Outputs:
+
+- `<out_root>/suite_manifest.json`: method definitions, commands, status, and logs.
+- `<out_root>/pure_deep/fold_metrics.csv`: strict pure deep OFP adapter.
+- `<out_root>/ofp_compat_deep/fold_metrics.csv`: model2-compatible direct deep adapter.
+- `<out_root>/hybrid_fusion/fold_metrics.csv`: deep embedding + model2 features + RF/XGB.
+
+See `EXPERIMENT_COMMANDS.md` for copy-paste commands covering single-method
+runs, ablations, lead-time sensitivity, and server pull/setup steps.
+
 ## Deep Embedding + Model2 Tabular Fusion
 
 This path first trains a deep model in the model2-compatible row task, extracts
 the embedding entering the final linear layer, concatenates it with model2
 engineered features, performs feature selection, and trains OFP-style tabular
-models (`rf`, `xgb`, `xgbrf`; `lgbm`/`catboost` are also supported if installed).
+models (`rf`, `xgb`, `xgbrf`, `lgbm`, `catboost`; optional packages are skipped
+unless `--require_all_ml` is set).
 
 Default: four deep embeddings (`patchtst`, `itransformer`, `fteformer`,
 `moderntcn`) + model2 features + deep score, followed by ExtraTrees top-k
@@ -100,7 +179,7 @@ Useful variants:
 DEEP_FEATURE_PARTS=embedding GPU_ID=0 bash OFP_DL_model2_compat/scripts/run_tabular_fusion.sh
 
 # ML model2 baseline under the same trained deep run, using model2 features only.
-ML_FEATURE_SET=model2 ML_MODELS="rf xgb xgbrf" GPU_ID=0 bash OFP_DL_model2_compat/scripts/run_tabular_fusion.sh
+ML_FEATURE_SET=model2 ML_MODELS="rf xgb lgbm catboost" GPU_ID=0 bash OFP_DL_model2_compat/scripts/run_tabular_fusion.sh
 
 # Same tabular fusion experiment under the 1-hour-minimum hit rule.
 MIN_HIT_LEAD_HOURS=1 GPU_ID=0 bash OFP_DL_model2_compat/scripts/run_tabular_fusion.sh
