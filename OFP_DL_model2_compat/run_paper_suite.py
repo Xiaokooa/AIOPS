@@ -35,6 +35,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, int]] = {
         "max_test_files": 40,
         "ml_n_estimators": 20,
         "select_k": 32,
+        "log_batches": 20,
     },
     "quick": {
         "epochs": 3,
@@ -48,6 +49,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, int]] = {
         "max_test_files": 1200,
         "ml_n_estimators": 300,
         "select_k": 96,
+        "log_batches": 100,
     },
     "formal": {
         "epochs": 8,
@@ -61,6 +63,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, int]] = {
         "max_test_files": 0,
         "ml_n_estimators": 500,
         "select_k": 128,
+        "log_batches": 200,
     },
 }
 
@@ -173,7 +176,7 @@ def common_args(args: argparse.Namespace, out_root: Path, target_mode: str, feat
         "--num_workers",
         str(args.num_workers),
         "--log_batches",
-        str(args.log_batches),
+        str(profile_int(args, "log_batches")),
     ]
     if not bool(args.threshold_search):
         cmd.append("--no_threshold_search")
@@ -368,7 +371,7 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(threshold_search=True)
     parser.add_argument("--min_hit_lead_hours", type=float, default=0.0)
     parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--log_batches", type=int, default=0)
+    parser.add_argument("--log_batches", type=int, default=None)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--no_tf32", action="store_true")
 

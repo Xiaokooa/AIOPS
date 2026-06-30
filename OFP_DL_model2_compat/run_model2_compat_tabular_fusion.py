@@ -37,8 +37,10 @@ from OFP_DL_model2_compat.run_model2_compat_deep import (
     file_label_map,
     format_epoch_status,
     format_duration,
+    format_rate,
     log_run_header,
     parse_threshold_grid,
+    progress_bar,
     score_dataset_selected_positions,
     score_files_to_memory,
     split_train_val_files,
@@ -110,15 +112,67 @@ def configure_runtime(cfg: CompatCfg, seed: int, fold: int) -> None:
             pass
 
 
+def log_stage_start(stage: str, deep_model_name: str, fold: int | None, **fields: object) -> float:
+    parts = [f"model={deep_model_name}"]
+    if fold is not None:
+        parts.append(f"fold={fold}")
+    parts.append(f"stage={stage}")
+    parts.extend(f"{key}={value}" for key, value in fields.items())
+    print("[stage-start] " + " ".join(parts), flush=True)
+    return time.time()
+
+
+def log_stage_done(stage: str, started: float, deep_model_name: str, fold: int | None, **fields: object) -> None:
+    parts = [f"model={deep_model_name}"]
+    if fold is not None:
+        parts.append(f"fold={fold}")
+    parts.append(f"stage={stage}")
+    parts.append(f"elapsed={format_duration(time.time() - started)}")
+    parts.extend(f"{key}={value}" for key, value in fields.items())
+    print("[stage-done] " + " ".join(parts), flush=True)
+
+
 def train_deep_model(
     model_name: str,
     train_files: list[str],
     cache: Model2FeatureCache,
     cfg: CompatCfg,
+    fold: int | None = None,
 ) -> tuple[nn.Module, dict[str, Any], dict[str, Any], CompatBatchedDataset]:
+    dataset_started = log_stage_start(
+        "build_deep_dataset",
+        model_name,
+        fold,
+        files=len(train_files),
+        sample_selection=cfg.sample_selection,
+        sampling_mode=cfg.sampling_mode,
+    )
     dataset = CompatBatchedDataset(train_files, cache, cfg)
+    log_stage_done(
+        "build_deep_dataset",
+        dataset_started,
+        model_name,
+        fold,
+        rows=int(dataset.total_rows),
+        source_rows=int(dataset.source_total_rows),
+        pos=int(dataset.pos_rows),
+        neg=int(dataset.neg_rows),
+    )
+    loader_started = log_stage_start(
+        "deep_train",
+        model_name,
+        fold,
+        epochs=cfg.epochs,
+        batch_size=cfg.batch_size,
+        rows=int(dataset.total_rows),
+    )
     loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=int(cfg.num_workers))
     pos_weight = effective_pos_weight(dataset, cfg)
+    print(
+        f"[deep-train-ready] model={model_name} fold={fold if fold is not None else '-'} "
+        f"batches={len(loader)} pos_weight={pos_weight:.4f} device={cfg.device}",
+        flush=True,
+    )
     loss_fn = nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(pos_weight, dtype=torch.float32, device=cfg.device),
         reduction="none",
@@ -140,7 +194,7 @@ def train_deep_model(
             format_epoch_status(
                 "deep-train",
                 model_name,
-                None,
+                fold,
                 epoch,
                 total_epochs,
                 float(parts["loss"]),
@@ -148,7 +202,8 @@ def train_deep_model(
                 float(parts["elapsed_seconds"]),
                 elapsed_total,
                 eta,
-            )
+            ),
+            flush=True,
         )
         if (
             float(cfg.adaptive_negative_weight) > 0.0
@@ -156,6 +211,7 @@ def train_deep_model(
             and epoch >= int(cfg.adaptive_warmup_epochs)
             and epoch < int(cfg.epochs)
         ):
+            adaptive_started = log_stage_start("adaptive_negative_weight", model_name, fold, after_epoch=epoch)
             scores_by_file = score_dataset_selected_positions(model, dataset, cache, cfg)
             adaptive_weight_meta = dataset.apply_adaptive_negative_weights(scores_by_file, float(cfg.adaptive_negative_weight))
             adaptive_weight_meta["applied_after_epoch"] = float(epoch)
@@ -164,8 +220,10 @@ def train_deep_model(
                 f"[adaptive-neg] rows={int(adaptive_weight_meta.get('updated_negative_rows', 0))} "
                 f"score_min={adaptive_weight_meta.get('min_score', 0.0):.5f} "
                 f"score_max={adaptive_weight_meta.get('max_score', 0.0):.5f} "
-                f"max_extra={cfg.adaptive_negative_weight}"
+                f"max_extra={cfg.adaptive_negative_weight}",
+                flush=True,
             )
+            log_stage_done("adaptive_negative_weight", adaptive_started, model_name, fold)
     train_meta = {
         "train_rows": int(dataset.total_rows),
         "train_source_rows": int(dataset.source_total_rows),
@@ -176,6 +234,7 @@ def train_deep_model(
         "history": history,
     }
     del optimizer, loader
+    log_stage_done("deep_train", loader_started, model_name, fold)
     return model, model_cfg, train_meta, dataset
 
 
@@ -289,12 +348,22 @@ def collect_training_table(
     deep_model_name: str,
     feature_set: str,
     deep_feature_parts: set[str],
+    fold: int | None = None,
+    stage_name: str = "collect_training_table",
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     base_names = compat_feature_names(cfg)
     hook = LastLinearInputHook(model)
     x_parts: list[np.ndarray] = []
     y_parts: list[np.ndarray] = []
     feature_names: list[str] = []
+    started = log_stage_start(
+        stage_name,
+        deep_model_name,
+        fold,
+        files=len(dataset.file_names),
+        feature_set=feature_set,
+        deep_parts=",".join(sorted(deep_feature_parts)),
+    )
     try:
         for idx, (file_name, positions) in enumerate(zip(dataset.file_names, dataset.selected_positions), 1):
             if len(positions) == 0:
@@ -306,12 +375,31 @@ def collect_training_table(
             x_parts.append(x_file)
             y_parts.append(block["labels"].astype(np.int8))
             if idx % 200 == 0:
-                print(f"[table-train] {idx}/{len(dataset.file_names)} files")
+                elapsed = time.time() - started
+                print(
+                    f"[stage-progress] model={deep_model_name} fold={fold if fold is not None else '-'} "
+                    f"stage={stage_name} {progress_bar(idx, len(dataset.file_names), width=18)} "
+                    f"files={idx}/{len(dataset.file_names)} rows={sum(len(part) for part in y_parts)} "
+                    f"rate={format_rate(idx, elapsed)} elapsed={format_duration(elapsed)}",
+                    flush=True,
+                )
     finally:
         hook.close()
     if not x_parts:
         raise ValueError("No rows collected for tabular ML training")
-    return np.concatenate(x_parts, axis=0), np.concatenate(y_parts, axis=0), feature_names
+    x_out = np.concatenate(x_parts, axis=0)
+    y_out = np.concatenate(y_parts, axis=0)
+    log_stage_done(
+        stage_name,
+        started,
+        deep_model_name,
+        fold,
+        rows=len(y_out),
+        features=x_out.shape[1],
+        positives=int(np.sum(y_out > 0)),
+        negatives=int(np.sum(y_out <= 0)),
+    )
+    return x_out, y_out, feature_names
 
 
 def fit_feature_selector(
@@ -322,6 +410,8 @@ def fit_feature_selector(
     select_k: int,
     seed: int,
     n_jobs: int,
+    deep_model_name: str = "",
+    fold: int | None = None,
 ) -> IndexSelector:
     n_features = int(x_train.shape[1])
     if n_features == 0:
@@ -331,6 +421,17 @@ def fit_feature_selector(
         return IndexSelector(list(range(n_features)), list(feature_names))
 
     name = str(selector_name).lower()
+    started = None
+    if deep_model_name:
+        started = log_stage_start(
+            "feature_select",
+            deep_model_name,
+            fold,
+            selector=name,
+            input_features=n_features,
+            select_k=k,
+            rows=len(y_train),
+        )
     if name == "variance":
         scores = np.nanvar(x_train, axis=0)
     elif name == "f_classif":
@@ -361,6 +462,8 @@ def fit_feature_selector(
     order = np.argsort(scores)[::-1]
     indices = sorted(int(i) for i in order[: min(k, n_features)])
     selected_names = [feature_names[i] for i in indices]
+    if started is not None:
+        log_stage_done("feature_select", started, deep_model_name, fold, selected=len(indices))
     return IndexSelector(indices, selected_names)
 
 
@@ -467,8 +570,21 @@ def train_ml_models(
     model_names: list[str],
     args: argparse.Namespace,
     seed: int,
+    deep_model_name: str = "",
+    fold: int | None = None,
+    stage_name: str = "ml_train",
 ) -> dict[str, Any]:
     models: dict[str, Any] = {}
+    stage_started = None
+    if deep_model_name:
+        stage_started = log_stage_start(
+            stage_name,
+            deep_model_name,
+            fold,
+            models=",".join(model_names),
+            rows=len(y_train),
+            features=x_train.shape[1],
+        )
     for name in model_names:
         tag = str(name).lower()
         try:
@@ -479,12 +595,22 @@ def train_ml_models(
             print(f"[ml-skip] model={tag} reason=missing optional dependency: {exc}")
             continue
         started = time.time()
-        print(f"[ml-train] model={tag} rows={len(y_train)} features={x_train.shape[1]}")
+        print(
+            f"[ml-train] deep_model={deep_model_name or '-'} fold={fold if fold is not None else '-'} "
+            f"model={tag} rows={len(y_train)} features={x_train.shape[1]}",
+            flush=True,
+        )
         estimator.fit(x_train, y_train)
-        print(f"[ml-train] model={tag} done min={(time.time() - started)/60.0:.2f}")
+        print(
+            f"[ml-train] deep_model={deep_model_name or '-'} fold={fold if fold is not None else '-'} "
+            f"model={tag} done elapsed={format_duration(time.time() - started)}",
+            flush=True,
+        )
         models[tag] = estimator
     if not models:
         raise ValueError("No tabular ML models were trained; install optional dependencies or change --ml_models")
+    if stage_started is not None:
+        log_stage_done(stage_name, stage_started, deep_model_name, fold, trained=",".join(sorted(models)))
     return models
 
 
@@ -498,10 +624,20 @@ def score_ml_models_to_memory(
     deep_model_name: str,
     feature_set: str,
     deep_feature_parts: set[str],
+    fold: int | None = None,
+    stage_name: str = "ml_score",
 ) -> dict[str, dict[str, pd.DataFrame]]:
     base_names = compat_feature_names(cfg)
     frames_by_model: dict[str, dict[str, pd.DataFrame]] = {name: {} for name in estimators}
     hook = LastLinearInputHook(model)
+    started = log_stage_start(
+        stage_name,
+        deep_model_name,
+        fold,
+        files=len(file_names),
+        models=",".join(sorted(estimators)),
+        feature_set=feature_set,
+    )
     try:
         for idx, file_name in enumerate(file_names, 1):
             block = extract_file_block(model, cache, file_name, cfg, hook)
@@ -533,9 +669,17 @@ def score_ml_models_to_memory(
                     )
                 frames_by_model[model_tag][file_name] = pd.concat(frames, ignore_index=True).sort_values("timestamp")
             if idx % 200 == 0:
-                print(f"[ml-score] {idx}/{len(file_names)} files")
+                elapsed = time.time() - started
+                print(
+                    f"[stage-progress] model={deep_model_name} fold={fold if fold is not None else '-'} "
+                    f"stage={stage_name} {progress_bar(idx, len(file_names), width=18)} "
+                    f"files={idx}/{len(file_names)} rate={format_rate(idx, elapsed)} "
+                    f"elapsed={format_duration(elapsed)}",
+                    flush=True,
+                )
     finally:
         hook.close()
+    log_stage_done(stage_name, started, deep_model_name, fold)
     return frames_by_model
 
 
@@ -722,7 +866,9 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
         min_hit_lead_hours=args.min_hit_lead_hours,
     )
     configure_runtime(cfg, args.seed, fold)
-    print(f"[tabular-init] deep_model={deep_model_name} fold={fold} {runtime_device_summary(cfg.device)}")
+    fold_started = time.time()
+    print(f"[tabular-init] deep_model={deep_model_name} fold={fold} {runtime_device_summary(cfg.device)}", flush=True)
+    index_started = log_stage_start("read_index_split", deep_model_name, fold, index_path=args.index_path)
     index_df = read_index(args.index_path)
     train_files, test_files = files_for_index_fold(index_df, int(fold))
     label_by_file = file_label_map(index_df)
@@ -731,6 +877,15 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
     if int(args.max_test_files) > 0:
         test_files = cap_files_stratified(test_files, label_by_file, int(args.max_test_files), int(args.seed) + 7919 + int(fold))
     train_files, val_files = split_train_val_files(train_files, label_by_file, cfg, int(fold))
+    log_stage_done(
+        "read_index_split",
+        index_started,
+        deep_model_name,
+        fold,
+        train=len(train_files),
+        val=len(val_files),
+        test=len(test_files),
+    )
 
     run_dir = Path(args.out_root) / deep_model_name / f"fold_{fold}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -757,11 +912,17 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
         },
     )
 
+    stats_started = log_stage_start("feature_norm_stats", deep_model_name, fold, files=len(train_files), data_dir=args.data_dir)
     stats = compute_feature_norm_stats(args.data_dir, train_files, cfg, label_by_file)
+    log_stage_done("feature_norm_stats", stats_started, deep_model_name, fold)
     mean, std = stats.arrays()
+    cache_started = log_stage_start("feature_cache_init", deep_model_name, fold, data_dir=args.data_dir)
     cache = Model2FeatureCache(args.data_dir, mean, std, cfg, label_by_file)
-    model, model_cfg, train_meta, dataset = train_deep_model(deep_model_name, train_files, cache, cfg)
+    log_stage_done("feature_cache_init", cache_started, deep_model_name, fold)
+    model, model_cfg, train_meta, dataset = train_deep_model(deep_model_name, train_files, cache, cfg, fold=fold)
+    save_started = log_stage_start("save_deep_checkpoint", deep_model_name, fold, path=run_dir / "deep_model.pt")
     torch.save({"state_dict": model.state_dict(), "cfg": asdict(cfg), "model_cfg": model_cfg}, run_dir / "deep_model.pt")
+    log_stage_done("save_deep_checkpoint", save_started, deep_model_name, fold)
 
     x_raw, y_train, raw_feature_names = collect_training_table(
         model,
@@ -771,6 +932,8 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
         deep_model_name,
         args.ml_feature_set,
         deep_parts,
+        fold=fold,
+        stage_name="collect_ml_train_table",
     )
     selector = fit_feature_selector(
         x_raw,
@@ -780,13 +943,31 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
         args.select_k,
         int(args.seed) + int(fold),
         args.n_jobs,
+        deep_model_name=deep_model_name,
+        fold=fold,
     )
     x_train = selector.transform(x_raw)
     save_selected_features(run_dir / "tabular" / "selected_features.csv", selector)
     ml_names = [name.lower() for name in args.ml_models]
-    ml_estimators = train_ml_models(x_train, y_train, ml_names, args, int(args.seed) + int(fold))
+    ml_estimators = train_ml_models(
+        x_train,
+        y_train,
+        ml_names,
+        args,
+        int(args.seed) + int(fold),
+        deep_model_name=deep_model_name,
+        fold=fold,
+    )
+    trained_ml_names = list(ml_estimators.keys())
+    print(
+        f"[ml-ready] deep_model={deep_model_name} fold={fold} requested={','.join(ml_names)} "
+        f"trained={','.join(trained_ml_names)}",
+        flush=True,
+    )
+    pickle_started = log_stage_start("save_ml_models", deep_model_name, fold, path=run_dir / "tabular" / "ml_models.pkl")
     with (run_dir / "tabular" / "ml_models.pkl").open("wb") as fh:
         pickle.dump({"selector": selector, "models": ml_estimators}, fh)
+    log_stage_done("save_ml_models", pickle_started, deep_model_name, fold)
 
     val_score_frames = score_ml_models_to_memory(
         ml_estimators,
@@ -798,6 +979,8 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
         deep_model_name,
         args.ml_feature_set,
         deep_parts,
+        fold=fold,
+        stage_name="score_val_files",
     )
     test_score_frames = score_ml_models_to_memory(
         ml_estimators,
@@ -809,12 +992,16 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
         deep_model_name,
         args.ml_feature_set,
         deep_parts,
+        fold=fold,
+        stage_name="score_test_files",
     )
 
     results: list[dict[str, Any]] = []
     thresholds: dict[str, float] = {}
-    for ml_name in ml_names:
+    eval_started = log_stage_start("threshold_eval", deep_model_name, fold, models=",".join(trained_ml_names))
+    for ml_name in trained_ml_names:
         tag = f"ml_{ml_name}_{args.ml_feature_set}"
+        tag_started = log_stage_start("threshold_eval_one", deep_model_name, fold, tag=tag)
         threshold, val_metrics = select_threshold_for_scores(val_score_frames[ml_name], args.data_dir, run_dir, tag, args)
         thresholds[tag] = threshold
         pred_dir = run_dir / "predictions" / tag
@@ -835,13 +1022,19 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
             "test_rows": int(test_rows),
             "metrics": metrics,
         }
-        print(f"[tabular-done] {tag} {format_metric_summary(metrics)}")
+        print(f"[tabular-done] fold={fold} {tag} threshold={threshold:.4f} rows={test_rows} {format_metric_summary(metrics)}", flush=True)
+        log_stage_done("threshold_eval_one", tag_started, deep_model_name, fold, tag=tag)
         results.append(result)
+    log_stage_done("threshold_eval", eval_started, deep_model_name, fold)
 
     if bool(args.write_deep_predictions) or bool(args.enable_parallel_fusion):
+        deep_score_started = log_stage_start("score_deep_val_files", deep_model_name, fold, files=len(val_files))
         deep_val_scores = score_files_to_memory(model, cache, val_files, cfg)
+        log_stage_done("score_deep_val_files", deep_score_started, deep_model_name, fold)
         deep_threshold, deep_val_metrics = select_threshold_for_scores(deep_val_scores, args.data_dir, run_dir, "deep_only", args)
+        deep_test_started = log_stage_start("score_deep_test_files", deep_model_name, fold, files=len(test_files))
         deep_test_scores = score_files_to_memory(model, cache, test_files, cfg)
+        log_stage_done("score_deep_test_files", deep_test_started, deep_model_name, fold)
         thresholds["deep_only"] = deep_threshold
         if bool(args.write_deep_predictions):
             pred_dir = run_dir / "predictions" / "deep_only"
@@ -864,7 +1057,7 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
                     "metrics": metrics,
                 }
             )
-            print(f"[deep-only-done] {format_metric_summary(metrics)}")
+            print(f"[deep-only-done] fold={fold} threshold={deep_threshold:.4f} rows={test_rows} {format_metric_summary(metrics)}", flush=True)
 
         if bool(args.enable_parallel_fusion):
             parallel_ml_name = str(args.parallel_ml_model).lower()
@@ -882,6 +1075,8 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
                     deep_model_name,
                     args.parallel_feature_set,
                     deep_parts,
+                    fold=fold,
+                    stage_name="collect_parallel_train_table",
                 )
                 parallel_selector = fit_feature_selector(
                     x_parallel_raw,
@@ -891,6 +1086,8 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
                     args.parallel_select_k,
                     int(args.seed) + int(fold) + 7919,
                     args.n_jobs,
+                    deep_model_name=deep_model_name,
+                    fold=fold,
                 )
                 save_selected_features(run_dir / "parallel_xgb" / "selected_features.csv", parallel_selector)
                 x_parallel = parallel_selector.transform(x_parallel_raw)
@@ -900,6 +1097,9 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
                     [parallel_ml_name],
                     args,
                     int(args.seed) + int(fold) + 7919,
+                    deep_model_name=deep_model_name,
+                    fold=fold,
+                    stage_name="parallel_ml_train",
                 )
                 parallel_val_scores = score_ml_models_to_memory(
                     parallel_estimators,
@@ -911,6 +1111,8 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
                     deep_model_name,
                     args.parallel_feature_set,
                     deep_parts,
+                    fold=fold,
+                    stage_name="score_parallel_val_files",
                 )
                 parallel_test_scores = score_ml_models_to_memory(
                     parallel_estimators,
@@ -922,6 +1124,8 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
                     deep_model_name,
                     args.parallel_feature_set,
                     deep_parts,
+                    fold=fold,
+                    stage_name="score_parallel_test_files",
                 )
             parallel_tag = f"parallel_{parallel_ml_name}_{args.parallel_feature_set}_or_deep"
             parallel_threshold, parallel_val_metrics = select_threshold_for_scores(
@@ -958,7 +1162,7 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
                     "metrics": metrics,
                 }
             )
-            print(f"[parallel-done] {parallel_tag} {format_metric_summary(metrics)}")
+            print(f"[parallel-done] fold={fold} {parallel_tag} threshold={parallel_threshold:.4f} rows={test_rows} {format_metric_summary(metrics)}", flush=True)
 
     fold_summary = {
         "deep_model": deep_model_name,
@@ -975,6 +1179,11 @@ def run_fold(deep_model_name: str, fold: int, args: argparse.Namespace) -> list[
         "results": results,
     }
     (run_dir / "fold_summary.json").write_text(json.dumps(fold_summary, indent=2, default=str), encoding="utf-8")
+    print(
+        f"[fold-done] deep_model={deep_model_name} fold={fold} "
+        f"elapsed={format_duration(time.time() - fold_started)} results={len(results)} out={run_dir}",
+        flush=True,
+    )
 
     del model, dataset, cache
     gc.collect()
