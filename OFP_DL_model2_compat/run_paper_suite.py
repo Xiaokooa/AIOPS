@@ -18,7 +18,7 @@ if __package__ in {None, ""}:
 from OFP_DL_model2_compat.run_model2_compat_deep import format_duration, progress_bar
 
 
-METHODS = ("pure_deep", "ofp_compat_deep", "hybrid_fusion")
+METHODS = ("model2_tabular", "pure_deep", "ofp_compat_deep", "hybrid_fusion")
 DEFAULT_MODELS = ["fits", "itransformer", "moderntcn", "patchtst"]
 DEFAULT_THRESHOLD_GRID = "0.001,0.003,0.005,0.01,0.02,0.03,0.05,0.07,0.10,0.15,0.20,0.25,0.30,0.40,0.50"
 
@@ -77,6 +77,20 @@ def profile_int(args: argparse.Namespace, name: str) -> int:
     if value is not None:
         return int(value)
     return int(PROFILE_DEFAULTS[str(args.profile)][name])
+
+
+def parallel_select_k(args: argparse.Namespace) -> int:
+    if args.parallel_select_k is not None:
+        return int(args.parallel_select_k)
+    return min(int(profile_int(args, "select_k")), 64)
+
+
+def tabular_select_k(args: argparse.Namespace) -> int:
+    if args.tabular_select_k is not None:
+        return int(args.tabular_select_k)
+    if str(args.tabular_selector).lower() == "none":
+        return 0
+    return int(profile_int(args, "select_k"))
 
 
 def selected_methods(raw: list[str]) -> list[str]:
@@ -189,6 +203,42 @@ def common_args(args: argparse.Namespace, out_root: Path, target_mode: str, feat
 
 def build_method_command(args: argparse.Namespace, method: str, method_root: Path) -> list[str]:
     py = str(args.python_executable)
+    if method == "model2_tabular":
+        ml_models = csv_words(args.ml_models)
+        cmd = [
+            py,
+            "-u",
+            "-B",
+            "OFP_DL_model2_compat/run_model2_compat_tabular_only.py",
+            *common_args(args, method_root, args.tabular_target_mode, args.tabular_feature_mode, args.tabular_rule_mode),
+            "--ml_models",
+            *ml_models,
+            "--selector",
+            str(args.tabular_selector),
+            "--select_k",
+            str(tabular_select_k(args)),
+            "--ml_n_estimators",
+            str(profile_int(args, "ml_n_estimators")),
+            "--rf_max_depth",
+            str(args.rf_max_depth),
+            "--rf_min_samples_leaf",
+            str(args.rf_min_samples_leaf),
+            "--xgb_max_depth",
+            str(args.xgb_max_depth),
+            "--xgb_lr",
+            str(args.xgb_lr),
+            "--xgb_subsample",
+            str(args.xgb_subsample),
+            "--xgb_colsample_bytree",
+            str(args.xgb_colsample_bytree),
+            "--xgb_tree_method",
+            str(args.xgb_tree_method),
+            "--n_jobs",
+            str(args.n_jobs),
+        ]
+        if bool(args.require_all_ml):
+            cmd.append("--require_all_ml")
+        return cmd
     if method == "pure_deep":
         return [
             py,
@@ -241,9 +291,21 @@ def build_method_command(args: argparse.Namespace, method: str, method_root: Pat
             str(args.xgb_tree_method),
             "--n_jobs",
             str(args.n_jobs),
+            "--parallel_ml_model",
+            str(args.parallel_ml_model),
+            "--parallel_feature_set",
+            str(args.parallel_feature_set),
+            "--parallel_selector",
+            str(args.parallel_selector),
+            "--parallel_select_k",
+            str(parallel_select_k(args)),
         ]
         if bool(args.require_all_ml):
             cmd.append("--require_all_ml")
+        if bool(args.enable_parallel_fusion):
+            cmd.append("--enable_parallel_fusion")
+        if bool(args.write_deep_predictions):
+            cmd.append("--write_deep_predictions")
         return cmd
     raise ValueError(method)
 
@@ -295,6 +357,15 @@ def run_logged(
 
 
 def method_description(args: argparse.Namespace, method: str) -> dict[str, str]:
+    if method == "model2_tabular":
+        return {
+            "driver": "tabular_only",
+            "target_mode": args.tabular_target_mode,
+            "feature_mode": args.tabular_feature_mode,
+            "rule_mode": args.tabular_rule_mode,
+            "selector": args.tabular_selector,
+            "meaning": "model2 engineered features followed by standalone RF/XGB/LightGBM/CatBoost classifiers",
+        }
     if method == "pure_deep":
         return {
             "driver": "deep",
@@ -316,13 +387,14 @@ def method_description(args: argparse.Namespace, method: str) -> dict[str, str]:
         "target_mode": args.hybrid_target_mode,
         "feature_mode": args.hybrid_feature_mode,
         "rule_mode": args.hybrid_rule_mode,
-        "meaning": "deep embedding/deep score plus model2 features, followed by RF/XGB-style tabular models",
+        "parallel_fusion": str(bool(args.enable_parallel_fusion)),
+        "meaning": "deep embedding/deep score plus model2 features for feature-level fusion; optional ML OR deep decision fusion",
     }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Paper-oriented OFP model2-compatible experiment suite.")
-    parser.add_argument("--methods", nargs="+", default=["all"], help="all, pure_deep, ofp_compat_deep, hybrid_fusion")
+    parser.add_argument("--methods", nargs="+", default=["all"], help="all, model2_tabular, pure_deep, ofp_compat_deep, hybrid_fusion")
     parser.add_argument("--profile", choices=["smoke", "quick", "formal"], default="formal")
     parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS)
     parser.add_argument("--folds", nargs="+", type=int, default=[1, 2, 3])
@@ -341,6 +413,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compat_target_mode", choices=["ahead120", "anomaly", "module_fault"], default="module_fault")
     parser.add_argument("--compat_feature_mode", choices=["model2", "model2_plus"], default="model2_plus")
     parser.add_argument("--compat_rule_mode", choices=["none", "temp", "model2_simple"], default="model2_simple")
+    parser.add_argument("--tabular_target_mode", choices=["ahead120", "anomaly", "module_fault"], default="module_fault")
+    parser.add_argument("--tabular_feature_mode", choices=["model2", "model2_plus"], default="model2")
+    parser.add_argument("--tabular_rule_mode", choices=["none", "temp", "model2_simple"], default="model2_simple")
+    parser.add_argument("--tabular_selector", choices=["none", "variance", "f_classif", "mutual_info", "extra_trees", "model_importance"], default="none")
+    parser.add_argument("--tabular_select_k", type=int, default=None)
     parser.add_argument("--hybrid_target_mode", choices=["ahead120", "anomaly", "module_fault"], default="module_fault")
     parser.add_argument("--hybrid_feature_mode", choices=["model2", "model2_plus"], default="model2_plus")
     parser.add_argument("--hybrid_rule_mode", choices=["none", "temp", "model2_simple"], default="model2_simple")
@@ -394,6 +471,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--xgb_tree_method", default="hist")
     parser.add_argument("--n_jobs", type=int, default=1)
     parser.add_argument("--require_all_ml", action="store_true")
+    parser.add_argument("--enable_parallel_fusion", action="store_true")
+    parser.add_argument("--parallel_ml_model", default="xgb")
+    parser.add_argument("--parallel_feature_set", choices=["model2", "embedding", "fusion"], default="model2")
+    parser.add_argument("--parallel_selector", choices=["none", "variance", "f_classif", "mutual_info", "extra_trees", "model_importance"], default="extra_trees")
+    parser.add_argument("--parallel_select_k", type=int, default=None)
+    parser.add_argument("--write_deep_predictions", action="store_true")
     return parser.parse_args()
 
 
