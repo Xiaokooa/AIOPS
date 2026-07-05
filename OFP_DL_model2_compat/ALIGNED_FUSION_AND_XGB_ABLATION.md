@@ -10,7 +10,7 @@ fusion encoder first:
 ```text
 raw telemetry window -> PatchTST -> projected embedding(256) -> latent(128)
 engineered/statistical features -> MLP -> latent(128)
-two latent tokens -> feature alignment -> cross-attention -> fused latent(128)
+two latent tokens -> feature alignment -> cross-attention/gated fusion -> fused latent(128)
 fused latent -> XGBoost
 ```
 
@@ -18,6 +18,13 @@ Quick one-fold command:
 
 ```bash
 GPU_ID=1 FOLD=1 bash OFP_DL_model2_compat/scripts/run_patchtst_stat_aligned_xgb_quick.sh
+```
+
+Precision-control one-fold command. Use this first when the quick run shows high
+recall but many false positives:
+
+```bash
+GPU_ID=1 FOLD=1 bash OFP_DL_model2_compat/scripts/run_patchtst_stat_aligned_xgb_precision_quick.sh
 ```
 
 Direct Python command:
@@ -32,6 +39,7 @@ CUDA_VISIBLE_DEVICES=1 python -u -B OFP_DL_model2_compat/run_patchtst_stat_align
   --batch_size 192 \
   --feature_mode model2_plus \
   --stat_feature_mode all_engineered \
+  --fusion_mode gated_attn \
   --sampling_mode module_balanced \
   --sample_selection hybrid \
   --temporal_positive_weight 2.0 \
@@ -39,12 +47,22 @@ CUDA_VISIBLE_DEVICES=1 python -u -B OFP_DL_model2_compat/run_patchtst_stat_align
   --positive_windows_per_module 32 \
   --negative_windows_per_faulty_module 8 \
   --normal_windows_per_module 8 \
+  --threshold_grid 0.001,0.003,0.005,0.01,0.02,0.03,0.05,0.07,0.10,0.15,0.20,0.25,0.30,0.40,0.50,0.60,0.70,0.80,0.85,0.90,0.93,0.95,0.97,0.98,0.99 \
   --max_train_files 2500 \
   --max_test_files 1200 \
+  --xgb_balance_mode auto \
   --ml_n_estimators 300 \
   --xgb_tree_method hist \
   --n_jobs 1
 ```
+
+Useful diagnostic switches:
+
+- `--fusion_mode gated_attn` uses modality gating after cross-attention.
+- `--fusion_mode attn_mean` reproduces the earlier mean-pooling fusion.
+- `--rule_mode none` evaluates the latent XGBoost without rule OR.
+- `--xgb_balance_mode none --no_xgb_sample_weight` removes duplicate class/row weighting.
+- `--stat_feature_mode model2_expert` tests only OFP expert relational features.
 
 Main outputs:
 

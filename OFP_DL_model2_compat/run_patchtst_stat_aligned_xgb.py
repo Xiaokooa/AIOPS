@@ -39,7 +39,6 @@ from OFP_DL_model2_compat.run_model2_compat_deep import (
 )
 from OFP_DL_model2_compat.run_model2_compat_tabular_fusion import (
     LastLinearInputHook,
-    build_ml_model,
     evaluate_prediction_output,
     log_stage_done,
     log_stage_start,
@@ -53,7 +52,10 @@ from OFP_DL_official.common.trainer import format_metric_summary, resolve_runtim
 
 
 RUN_NAME = "patchtst_stat_aligned_xgb"
-DEFAULT_THRESHOLD_GRID = "0.001,0.003,0.005,0.01,0.02,0.03,0.05,0.07,0.10,0.15,0.20,0.25,0.30,0.40,0.50"
+DEFAULT_THRESHOLD_GRID = (
+    "0.001,0.003,0.005,0.01,0.02,0.03,0.05,0.07,0.10,0.15,0.20,0.25,0.30,0.40,0.50,"
+    "0.60,0.70,0.80,0.85,0.90,0.93,0.95,0.97,0.98,0.99"
+)
 RAW_SEQUENCE_FEATURES = [
     "Temp",
     "Curr",
@@ -193,8 +195,10 @@ class PatchTSTStatAligner(nn.Module):
         stat_hidden: int = 256,
         attn_heads: int = 4,
         dropout: float = 0.2,
+        fusion_mode: str = "gated_attn",
     ) -> None:
         super().__init__()
+        self.fusion_mode = str(fusion_mode)
         self.patchtst, self.patchtst_cfg, _ = build_patchtst(int(seq_len), int(n_raw_features))
         self.patch_hook = LastLinearInputHook(self.patchtst)
         self.seq_embedding = nn.LazyLinear(int(embedding_dim))
@@ -217,6 +221,11 @@ class PatchTSTStatAligner(nn.Module):
             num_heads=int(attn_heads),
             dropout=float(dropout),
             batch_first=True,
+        )
+        self.modality_gate = nn.Sequential(
+            nn.LayerNorm(int(latent_dim) * 2),
+            nn.Linear(int(latent_dim) * 2, int(latent_dim)),
+            nn.Sigmoid(),
         )
         self.fusion = nn.Sequential(
             nn.LayerNorm(int(latent_dim) * 2),
@@ -245,7 +254,16 @@ class PatchTSTStatAligner(nn.Module):
         tokens = torch.stack([seq_latent, stat_latent], dim=1)
         aligned = self.feature_alignment(tokens)
         attended, _weights = self.cross_attention(aligned, aligned, aligned, need_weights=False)
-        pooled = torch.cat([tokens.mean(dim=1), attended.mean(dim=1)], dim=1)
+        if self.fusion_mode == "attn_mean":
+            pooled = torch.cat([tokens.mean(dim=1), attended.mean(dim=1)], dim=1)
+        elif self.fusion_mode == "gated_attn":
+            seq_context = 0.5 * (seq_latent + attended[:, 0, :])
+            stat_context = 0.5 * (stat_latent + attended[:, 1, :])
+            gate = self.modality_gate(torch.cat([seq_latent, stat_latent], dim=1))
+            gated = gate * seq_context + (1.0 - gate) * stat_context
+            pooled = torch.cat([gated, attended.mean(dim=1)], dim=1)
+        else:
+            raise ValueError(f"Unknown fusion_mode={self.fusion_mode!r}")
         return self.fusion(pooled)
 
     def forward(self, raw_x: torch.Tensor, raw_mask: torch.Tensor, stat_x: torch.Tensor) -> torch.Tensor:
@@ -305,6 +323,7 @@ def train_fusion_encoder(
         stat_hidden=args.stat_hidden,
         attn_heads=args.attn_heads,
         dropout=args.dropout,
+        fusion_mode=args.fusion_mode,
     ).to(cfg.device)
     initialize_lazy_layers(model, fusion_dataset, cfg)
     loader = DataLoader(fusion_dataset, batch_size=None, shuffle=False, num_workers=int(cfg.num_workers))
@@ -523,6 +542,52 @@ def collect_fused_training_table(
     return x, y, w, [f"aligned_latent_{idx:03d}" for idx in range(x.shape[1])]
 
 
+def build_aligned_xgb_model(args: argparse.Namespace, y_train: np.ndarray, seed: int) -> tuple[Any, dict[str, Any]]:
+    classes = np.unique(y_train)
+    if len(classes) < 2:
+        from sklearn.dummy import DummyClassifier
+
+        constant = int(classes[0]) if len(classes) else 0
+        return DummyClassifier(strategy="constant", constant=constant), {
+            "xgb_balance_mode": "dummy",
+            "xgb_scale_pos_weight": 1.0,
+        }
+
+    from xgboost import XGBClassifier
+
+    pos = float(np.sum(y_train > 0))
+    neg = float(np.sum(y_train <= 0))
+    raw_scale = neg / max(pos, 1.0)
+    balance_mode = str(args.xgb_balance_mode).lower()
+    if balance_mode == "auto":
+        scale_pos_weight = raw_scale
+    elif balance_mode == "sqrt":
+        scale_pos_weight = float(np.sqrt(raw_scale))
+    elif balance_mode == "none":
+        scale_pos_weight = 1.0
+    else:
+        raise ValueError("Unknown xgb_balance_mode; use auto, sqrt, or none")
+
+    estimator = XGBClassifier(
+        n_estimators=int(args.ml_n_estimators),
+        max_depth=int(args.xgb_max_depth),
+        learning_rate=float(args.xgb_lr),
+        subsample=float(args.xgb_subsample),
+        colsample_bytree=float(args.xgb_colsample_bytree),
+        eval_metric="logloss",
+        tree_method=str(args.xgb_tree_method),
+        random_state=int(seed),
+        n_jobs=int(args.n_jobs),
+        scale_pos_weight=float(scale_pos_weight),
+    )
+    meta: dict[str, Any] = {
+        "xgb_balance_mode": balance_mode,
+        "xgb_scale_pos_weight": float(scale_pos_weight),
+        "xgb_raw_scale_pos_weight": float(raw_scale),
+    }
+    return estimator, meta
+
+
 def score_fused_files_to_memory(
     estimator: Any,
     model: PatchTSTStatAligner,
@@ -634,8 +699,11 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
             "target": cfg.target_mode,
             "feature mode": cfg.feature_mode,
             "stat features": args.stat_feature_mode,
+            "fusion mode": args.fusion_mode,
             "rule mode": cfg.rule_mode,
             "sample selection": cfg.sample_selection,
+            "xgb balance": args.xgb_balance_mode,
+            "xgb sample weight": bool(args.xgb_use_sample_weight),
             "seq_len": cfg.seq_len,
             "epochs": cfg.epochs,
             "batch_size": cfg.batch_size,
@@ -669,6 +737,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
             "patchtst_cfg": model.patchtst_cfg,
             "raw_features": raw_names,
             "stat_features": stat_names,
+            "fusion_mode": args.fusion_mode,
             "train_meta": train_meta,
         },
         run_dir / "aligned_encoder.pt",
@@ -676,15 +745,24 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
     x_train, y_train, sample_weight, latent_names = collect_fused_training_table(
         model, cache, dataset, cfg, raw_indices, stat_indices, int(fold)
     )
-    estimator = build_ml_model("xgb", args, y_train, int(args.seed) + int(fold))
-    ml_started = log_stage_start("xgb_train_on_fused_latent", RUN_NAME, fold, rows=len(y_train), features=x_train.shape[1])
+    estimator, xgb_meta = build_aligned_xgb_model(args, y_train, int(args.seed) + int(fold))
+    ml_started = log_stage_start(
+        "xgb_train_on_fused_latent",
+        RUN_NAME,
+        fold,
+        rows=len(y_train),
+        features=x_train.shape[1],
+        balance=args.xgb_balance_mode,
+        scale_pos_weight=f"{float(xgb_meta.get('xgb_scale_pos_weight', 1.0)):.4f}",
+        sample_weight=bool(args.xgb_use_sample_weight),
+    )
     if bool(args.xgb_use_sample_weight):
         estimator.fit(x_train, y_train, sample_weight=sample_weight)
     else:
         estimator.fit(x_train, y_train)
     log_stage_done("xgb_train_on_fused_latent", ml_started, RUN_NAME, fold)
     with (run_dir / "xgb_fused_latent.pkl").open("wb") as fh:
-        pickle.dump({"model": estimator, "feature_names": latent_names}, fh)
+        pickle.dump({"model": estimator, "feature_names": latent_names, "xgb_meta": xgb_meta}, fh)
     val_scores = score_fused_files_to_memory(estimator, model, cache, val_files, cfg, raw_indices, stat_indices, int(fold), "score_val_files")
     test_scores = score_fused_files_to_memory(estimator, model, cache, test_files, cfg, raw_indices, stat_indices, int(fold), "score_test_files")
     threshold, val_metrics = select_threshold_for_scores(val_scores, args.data_dir, run_dir, "aligned_latent_xgb", args)
@@ -701,6 +779,10 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         "ml_feature_set": "aligned_latent",
         "selector": "none",
         "selected_feature_count": int(x_train.shape[1]),
+        "fusion_mode": args.fusion_mode,
+        "xgb_balance_mode": args.xgb_balance_mode,
+        "xgb_use_sample_weight": bool(args.xgb_use_sample_weight),
+        "xgb_scale_pos_weight": float(xgb_meta.get("xgb_scale_pos_weight", 1.0)),
         "threshold": float(threshold),
         "val_metrics": val_metrics,
         "test_rows": int(test_rows),
@@ -726,6 +808,10 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
             "ml_feature_set": item.get("ml_feature_set", ""),
             "selector": item.get("selector", ""),
             "selected_feature_count": int(item.get("selected_feature_count", 0)),
+            "fusion_mode": item.get("fusion_mode", args.fusion_mode),
+            "xgb_balance_mode": item.get("xgb_balance_mode", args.xgb_balance_mode),
+            "xgb_use_sample_weight": bool(item.get("xgb_use_sample_weight", args.xgb_use_sample_weight)),
+            "xgb_scale_pos_weight": float(item.get("xgb_scale_pos_weight", 1.0)),
             "threshold": float(item.get("threshold", 0.0)),
             "target_mode": args.target_mode,
             "feature_mode": args.feature_mode,
@@ -745,10 +831,35 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
     if path.exists():
         old = pd.read_csv(path)
         frame = pd.concat([old, frame], ignore_index=True)
-        frame.drop_duplicates(subset=["deep_model", "fold", "mode", "stat_feature_mode", "rule_mode"], keep="last", inplace=True)
+        frame.drop_duplicates(
+            subset=[
+                "deep_model",
+                "fold",
+                "mode",
+                "stat_feature_mode",
+                "fusion_mode",
+                "xgb_balance_mode",
+                "xgb_use_sample_weight",
+                "rule_mode",
+            ],
+            keep="last",
+            inplace=True,
+        )
     frame.sort_values(["deep_model", "mode", "fold"], inplace=True)
     frame.to_csv(path, index=False)
-    group_cols = ["deep_model", "mode", "target_mode", "feature_mode", "stat_feature_mode", "sampling_mode", "rule_mode", "min_hit_lead_hours"]
+    group_cols = [
+        "deep_model",
+        "mode",
+        "target_mode",
+        "feature_mode",
+        "stat_feature_mode",
+        "fusion_mode",
+        "sampling_mode",
+        "rule_mode",
+        "xgb_balance_mode",
+        "xgb_use_sample_weight",
+        "min_hit_lead_hours",
+    ]
     non_metric_cols = set(group_cols) | {"fold", "ml_model", "ml_feature_set", "selector"}
     numeric = [col for col in frame.columns if col not in non_metric_cols and pd.api.types.is_numeric_dtype(frame[col])]
     summary = frame.groupby(group_cols, dropna=False)[numeric].agg(["mean", "std"])
@@ -806,7 +917,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stat_hidden", type=int, default=256)
     parser.add_argument("--attn_heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--xgb_use_sample_weight", action="store_true", default=True)
+    parser.add_argument("--fusion_mode", choices=["gated_attn", "attn_mean"], default="gated_attn")
+    parser.add_argument("--xgb_balance_mode", choices=["auto", "sqrt", "none"], default="auto")
+    parser.add_argument("--xgb_use_sample_weight", dest="xgb_use_sample_weight", action="store_true")
+    parser.add_argument("--no_xgb_sample_weight", dest="xgb_use_sample_weight", action="store_false")
+    parser.set_defaults(xgb_use_sample_weight=True)
     parser.add_argument("--ml_n_estimators", type=int, default=300)
     parser.add_argument("--xgb_max_depth", type=int, default=5)
     parser.add_argument("--xgb_lr", type=float, default=0.05)
