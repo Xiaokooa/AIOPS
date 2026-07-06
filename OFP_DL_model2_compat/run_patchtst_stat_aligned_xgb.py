@@ -46,6 +46,11 @@ from OFP_DL_model2_compat.run_model2_compat_tabular_fusion import (
     select_threshold_for_scores,
     write_threshold_predictions,
 )
+from OFP_DL_model2_compat.lead_time_sweep import (
+    DEFAULT_LEAD_TIME_GRID,
+    append_lead_time_sweep_results,
+    run_lead_time_sweep,
+)
 from OFP_DL_official.PatchTST.model import build_model as build_patchtst
 from OFP_DL_official.common.index_split import files_for_index_fold, read_index
 from OFP_DL_official.common.trainer import format_metric_summary, resolve_runtime_device
@@ -770,6 +775,31 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
     eval_dir = run_dir / "evaluation" / "aligned_latent_xgb"
     test_rows = write_threshold_predictions(test_scores, pred_dir, threshold)
     metrics, _detail = evaluate_prediction_output(pred_dir, args.data_dir, eval_dir, args.min_hit_lead_hours)
+    if str(args.lead_time_grid).strip():
+        sweep_rows = run_lead_time_sweep(
+            val_scores,
+            test_scores,
+            args.data_dir,
+            run_dir,
+            "aligned_latent_xgb",
+            int(fold),
+            args.lead_time_grid,
+            args.threshold_grid,
+            args.threshold_metric,
+            args.fixed_threshold,
+            bool(args.threshold_search),
+            metadata={
+                "run_name": RUN_NAME,
+                "mode": "aligned_latent_xgb",
+                "feature_mode": args.feature_mode,
+                "stat_feature_mode": args.stat_feature_mode,
+                "fusion_mode": args.fusion_mode,
+                "rule_mode": cfg.rule_mode,
+                "xgb_balance_mode": args.xgb_balance_mode,
+                "xgb_use_sample_weight": bool(args.xgb_use_sample_weight),
+            },
+        )
+        append_lead_time_sweep_results(sweep_rows, Path(args.out_root))
     print(f"[aligned-done] fold={fold} threshold={threshold:.4f} rows={test_rows} {format_metric_summary(metrics)}", flush=True)
     result = {
         "deep_model": RUN_NAME,
@@ -902,6 +932,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_threshold_search", dest="threshold_search", action="store_false")
     parser.set_defaults(threshold_search=True)
     parser.add_argument("--min_hit_lead_hours", type=float, default=0.0)
+    parser.add_argument(
+        "--lead_time_grid",
+        default="",
+        help=f"Optional DRAM-style lead-time sweep, e.g. '{DEFAULT_LEAD_TIME_GRID}'. Values accept m/min/h suffixes.",
+    )
     parser.add_argument("--max_cached_files", type=int, default=128)
     parser.add_argument("--max_train_files", type=int, default=2500)
     parser.add_argument("--max_test_files", type=int, default=1200)

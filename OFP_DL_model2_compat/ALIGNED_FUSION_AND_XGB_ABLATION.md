@@ -72,6 +72,23 @@ Main outputs:
 - `patchtst_stat_aligned_xgb/fold_*/aligned_encoder.pt`
 - `patchtst_stat_aligned_xgb/fold_*/xgb_fused_latent.pkl`
 
+DRAM-style lead-time sensitivity can be evaluated in the same training run. The
+lead-time grid uses the first-warning evaluator with a stricter minimum hit lead
+time, and re-selects the operating threshold on validation traces for each lead
+requirement:
+
+```bash
+GPU_ID=1 FOLDS="1 2 3" bash OFP_DL_model2_compat/scripts/run_patchtst_stat_aligned_xgb_lead_sweep.sh
+```
+
+Default grid: `1m,5m,15m,30m,1h,2h,5h,12h,24h`.
+
+Main outputs:
+
+- `lead_time_sweep.csv`
+- `lead_time_sweep_mean_std.csv`
+- `patchtst_stat_aligned_xgb/fold_*/lead_time_sweep/aligned_latent_xgb/lead_time_sweep.csv`
+
 ## 2. XGBoost-only DRAM-inspired ablation
 
 The ablation fixes the final classifier as XGBoost and opens the improvements
@@ -119,3 +136,13 @@ Main outputs:
 - `variant_metrics_mean_std.csv`
 - `<variant>/fold_*/variant.json`
 - `<variant>/fold_*/xgb_model.pkl`
+
+Lead-time sensitivity for the XGBoost-only path:
+
+```bash
+FOLDS="1 2 3" VARIANTS="full_dram_xgb" bash OFP_DL_model2_compat/scripts/run_xgb_dram_lead_sweep.sh
+```
+
+Use `VARIANTS="all"` to run the lead-time table for every cumulative XGBoost
+ablation variant. Outputs are written to `lead_time_sweep.csv` and
+`lead_time_sweep_mean_std.csv` under the selected `OUT_ROOT`.

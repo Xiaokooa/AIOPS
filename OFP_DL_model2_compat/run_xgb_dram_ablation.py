@@ -42,6 +42,11 @@ from OFP_DL_model2_compat.run_model2_compat_tabular_fusion import (
     write_threshold_predictions,
 )
 from OFP_DL_model2_compat.run_model2_compat_tabular_only import score_model2_files_to_memory
+from OFP_DL_model2_compat.lead_time_sweep import (
+    DEFAULT_LEAD_TIME_GRID,
+    append_lead_time_sweep_results,
+    run_lead_time_sweep,
+)
 from OFP_DL_official.common.index_split import files_for_index_fold, read_index
 from OFP_DL_official.common.trainer import format_metric_summary
 
@@ -374,6 +379,33 @@ def run_variant(
     eval_dir = run_dir / "evaluation" / tag
     test_rows = write_threshold_predictions(test_score_frames["xgb"], pred_dir, threshold)
     metrics, _detail = evaluate_prediction_output(pred_dir, args.data_dir, eval_dir, args.min_hit_lead_hours)
+    if str(args.lead_time_grid).strip():
+        sweep_rows = run_lead_time_sweep(
+            val_score_frames["xgb"],
+            test_score_frames["xgb"],
+            args.data_dir,
+            run_dir,
+            tag,
+            int(fold),
+            args.lead_time_grid,
+            args.threshold_grid,
+            args.threshold_metric,
+            args.fixed_threshold,
+            bool(args.threshold_search),
+            metadata={
+                "run_name": RUN_NAME,
+                "variant": variant.name,
+                "mode": tag,
+                "feature_mode": cfg.feature_mode,
+                "sample_selection": cfg.sample_selection,
+                "temporal_positive_weight": float(cfg.temporal_positive_weight),
+                "adaptive_negative_weight": float(variant.adaptive_negative_weight),
+                "rule_mode": cfg.rule_mode,
+                "selector": args.selector,
+                "selected_feature_count": len(selector.indices),
+            },
+        )
+        append_lead_time_sweep_results(sweep_rows, Path(args.out_root))
     print(f"[ablation-done] fold={fold} variant={variant.name} threshold={threshold:.4f} rows={test_rows} {format_metric_summary(metrics)}", flush=True)
     del cache, dataset
     gc.collect()
@@ -492,6 +524,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_threshold_search", dest="threshold_search", action="store_false")
     parser.set_defaults(threshold_search=True)
     parser.add_argument("--min_hit_lead_hours", type=float, default=0.0)
+    parser.add_argument(
+        "--lead_time_grid",
+        default="",
+        help=f"Optional DRAM-style lead-time sweep, e.g. '{DEFAULT_LEAD_TIME_GRID}'. Values accept m/min/h suffixes.",
+    )
     parser.add_argument("--max_cached_files", type=int, default=128)
     parser.add_argument("--max_train_files", type=int, default=2500)
     parser.add_argument("--max_test_files", type=int, default=1200)
