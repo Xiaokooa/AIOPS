@@ -201,9 +201,11 @@ class PatchTSTStatAligner(nn.Module):
         attn_heads: int = 4,
         dropout: float = 0.2,
         fusion_mode: str = "gated_attn",
+        tsf_ablation: str = "full",
     ) -> None:
         super().__init__()
         self.fusion_mode = str(fusion_mode)
+        self.tsf_ablation = str(tsf_ablation)
         self.patchtst, self.patchtst_cfg, _ = build_patchtst(int(seq_len), int(n_raw_features))
         self.patch_hook = LastLinearInputHook(self.patchtst)
         self.seq_embedding = nn.LazyLinear(int(embedding_dim))
@@ -256,9 +258,16 @@ class PatchTSTStatAligner(nn.Module):
         seq_emb = self.seq_embedding(emb)
         seq_latent = self.seq_projection(seq_emb)
         stat_latent = self.stat_mlp(stat_x)
+        if self.tsf_ablation == "no_stat_branch":
+            stat_latent = torch.zeros_like(stat_latent)
+        elif self.tsf_ablation == "no_temporal_branch":
+            seq_latent = torch.zeros_like(seq_latent)
         tokens = torch.stack([seq_latent, stat_latent], dim=1)
         aligned = self.feature_alignment(tokens)
-        attended, _weights = self.cross_attention(aligned, aligned, aligned, need_weights=False)
+        if self.tsf_ablation == "no_cross_attention":
+            attended = aligned
+        else:
+            attended, _weights = self.cross_attention(aligned, aligned, aligned, need_weights=False)
         if self.fusion_mode == "attn_mean":
             pooled = torch.cat([tokens.mean(dim=1), attended.mean(dim=1)], dim=1)
         elif self.fusion_mode == "gated_attn":
@@ -329,6 +338,7 @@ def train_fusion_encoder(
         attn_heads=args.attn_heads,
         dropout=args.dropout,
         fusion_mode=args.fusion_mode,
+        tsf_ablation=args.tsf_ablation,
     ).to(cfg.device)
     initialize_lazy_layers(model, fusion_dataset, cfg)
     loader = DataLoader(fusion_dataset, batch_size=None, shuffle=False, num_workers=int(cfg.num_workers))
@@ -705,6 +715,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
             "feature mode": cfg.feature_mode,
             "stat features": args.stat_feature_mode,
             "fusion mode": args.fusion_mode,
+            "tsf ablation": args.tsf_ablation,
             "rule mode": cfg.rule_mode,
             "sample selection": cfg.sample_selection,
             "xgb balance": args.xgb_balance_mode,
@@ -743,6 +754,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
             "raw_features": raw_names,
             "stat_features": stat_names,
             "fusion_mode": args.fusion_mode,
+            "tsf_ablation": args.tsf_ablation,
             "train_meta": train_meta,
         },
         run_dir / "aligned_encoder.pt",
@@ -794,6 +806,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
                 "feature_mode": args.feature_mode,
                 "stat_feature_mode": args.stat_feature_mode,
                 "fusion_mode": args.fusion_mode,
+                "tsf_ablation": args.tsf_ablation,
                 "rule_mode": cfg.rule_mode,
                 "xgb_balance_mode": args.xgb_balance_mode,
                 "xgb_use_sample_weight": bool(args.xgb_use_sample_weight),
@@ -810,6 +823,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         "selector": "none",
         "selected_feature_count": int(x_train.shape[1]),
         "fusion_mode": args.fusion_mode,
+        "tsf_ablation": args.tsf_ablation,
         "xgb_balance_mode": args.xgb_balance_mode,
         "xgb_use_sample_weight": bool(args.xgb_use_sample_weight),
         "xgb_scale_pos_weight": float(xgb_meta.get("xgb_scale_pos_weight", 1.0)),
@@ -839,6 +853,7 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
             "selector": item.get("selector", ""),
             "selected_feature_count": int(item.get("selected_feature_count", 0)),
             "fusion_mode": item.get("fusion_mode", args.fusion_mode),
+            "tsf_ablation": item.get("tsf_ablation", args.tsf_ablation),
             "xgb_balance_mode": item.get("xgb_balance_mode", args.xgb_balance_mode),
             "xgb_use_sample_weight": bool(item.get("xgb_use_sample_weight", args.xgb_use_sample_weight)),
             "xgb_scale_pos_weight": float(item.get("xgb_scale_pos_weight", 1.0)),
@@ -868,6 +883,7 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
                 "mode",
                 "stat_feature_mode",
                 "fusion_mode",
+                "tsf_ablation",
                 "xgb_balance_mode",
                 "xgb_use_sample_weight",
                 "rule_mode",
@@ -884,6 +900,7 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
         "feature_mode",
         "stat_feature_mode",
         "fusion_mode",
+        "tsf_ablation",
         "sampling_mode",
         "rule_mode",
         "xgb_balance_mode",
@@ -953,6 +970,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn_heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--fusion_mode", choices=["gated_attn", "attn_mean"], default="gated_attn")
+    parser.add_argument(
+        "--tsf_ablation",
+        choices=["full", "no_stat_branch", "no_temporal_branch", "no_cross_attention"],
+        default="full",
+        help="TSF module ablation used for Table 5.",
+    )
     parser.add_argument("--xgb_balance_mode", choices=["auto", "sqrt", "none"], default="auto")
     parser.add_argument("--xgb_use_sample_weight", dest="xgb_use_sample_weight", action="store_true")
     parser.add_argument("--no_xgb_sample_weight", dest="xgb_use_sample_weight", action="store_false")
