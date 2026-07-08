@@ -3,11 +3,13 @@ set -euo pipefail
 
 GPU_ID="${GPU_ID:-0}"
 FOLD="${FOLD:-1}"
-OUT_ROOT="${OUT_ROOT:-OFP_DL_model2_compat_results/patchtst_stat_aligned_xgb_precision_quick_fold${FOLD}}"
+TEMPORAL_ENCODER="${TEMPORAL_ENCODER:-patchtst}"
+OUT_ROOT="${OUT_ROOT:-OFP_DL_model2_compat_results/${TEMPORAL_ENCODER}_stat_aligned_xgb_precision_quick_fold${FOLD}}"
 
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 python -u -B OFP_DL_model2_compat/run_patchtst_stat_aligned_xgb.py \
+  --temporal_encoder "${TEMPORAL_ENCODER}" \
   --folds "${FOLD}" \
   --device cuda \
   --out_root "${OUT_ROOT}" \

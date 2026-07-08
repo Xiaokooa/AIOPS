@@ -3,7 +3,8 @@ set -euo pipefail
 
 GPU_ID="${GPU_ID:-0}"
 FOLDS="${FOLDS:-1 2 3}"
-OUT_ROOT="${OUT_ROOT:-OFP_DL_model2_compat_results/patchtst_stat_aligned_xgb_lead_sweep}"
+TEMPORAL_ENCODER="${TEMPORAL_ENCODER:-patchtst}"
+OUT_ROOT="${OUT_ROOT:-OFP_DL_model2_compat_results/${TEMPORAL_ENCODER}_stat_aligned_xgb_lead_sweep}"
 MAX_TRAIN_FILES="${MAX_TRAIN_FILES:-0}"
 MAX_TEST_FILES="${MAX_TEST_FILES:-0}"
 LEAD_TIME_GRID="${LEAD_TIME_GRID:-1m,5m,15m,30m,1h,2h,5h,12h,24h}"
@@ -13,6 +14,7 @@ export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 # shellcheck disable=SC2086
 python -u -B OFP_DL_model2_compat/run_patchtst_stat_aligned_xgb.py \
+  --temporal_encoder "${TEMPORAL_ENCODER}" \
   --folds ${FOLDS} \
   --device cuda \
   --out_root "${OUT_ROOT}" \

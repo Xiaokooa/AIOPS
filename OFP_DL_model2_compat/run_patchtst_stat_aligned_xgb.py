@@ -20,6 +20,7 @@ if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from OFP_DL_model2_compat.run_model2_compat_deep import (
+    BUILDERS,
     CompatBatchedDataset,
     CompatCfg,
     Model2FeatureCache,
@@ -51,12 +52,12 @@ from OFP_DL_model2_compat.lead_time_sweep import (
     append_lead_time_sweep_results,
     run_lead_time_sweep,
 )
-from OFP_DL_official.PatchTST.model import build_model as build_patchtst
 from OFP_DL_official.common.index_split import files_for_index_fold, read_index
 from OFP_DL_official.common.trainer import format_metric_summary, resolve_runtime_device
 
 
 RUN_NAME = "patchtst_stat_aligned_xgb"
+TEMPORAL_ENCODERS = ("patchtst", "itransformer", "moderntcn", "fits")
 DEFAULT_THRESHOLD_GRID = (
     "0.001,0.003,0.005,0.01,0.02,0.03,0.05,0.07,0.10,0.15,0.20,0.25,0.30,0.40,0.50,"
     "0.60,0.70,0.80,0.85,0.90,0.93,0.95,0.97,0.98,0.99"
@@ -75,6 +76,10 @@ RAW_SEQUENCE_FEATURES = [
     "TxP3",
     "TxP4",
 ]
+
+
+def tsf_run_name(temporal_encoder: str) -> str:
+    return f"{str(temporal_encoder).lower()}_stat_aligned_xgb"
 
 
 def configure_runtime(cfg: CompatCfg, seed: int, fold: int) -> None:
@@ -189,9 +194,10 @@ class SelectedWindowStatDataset(IterableDataset):
                 )
 
 
-class PatchTSTStatAligner(nn.Module):
+class TemporalStatAligner(nn.Module):
     def __init__(
         self,
+        temporal_encoder: str,
         seq_len: int,
         n_raw_features: int,
         n_stat_features: int,
@@ -204,10 +210,16 @@ class PatchTSTStatAligner(nn.Module):
         tsf_ablation: str = "full",
     ) -> None:
         super().__init__()
+        self.temporal_encoder = str(temporal_encoder).lower()
+        if self.temporal_encoder not in TEMPORAL_ENCODERS:
+            raise ValueError(f"Unknown temporal_encoder={temporal_encoder!r}; use one of {TEMPORAL_ENCODERS}")
         self.fusion_mode = str(fusion_mode)
         self.tsf_ablation = str(tsf_ablation)
-        self.patchtst, self.patchtst_cfg, _ = build_patchtst(int(seq_len), int(n_raw_features))
-        self.patch_hook = LastLinearInputHook(self.patchtst)
+        self.temporal_model, self.temporal_encoder_cfg, _ = BUILDERS[self.temporal_encoder](
+            int(seq_len),
+            int(n_raw_features),
+        )
+        self.temporal_hook = LastLinearInputHook(self.temporal_model)
         self.seq_embedding = nn.LazyLinear(int(embedding_dim))
         self.seq_projection = nn.Sequential(
             nn.LayerNorm(int(embedding_dim)),
@@ -243,14 +255,14 @@ class PatchTSTStatAligner(nn.Module):
         self.classifier = nn.Linear(int(latent_dim), 1)
 
     def close(self) -> None:
-        self.patch_hook.close()
+        self.temporal_hook.close()
 
     def encode(self, raw_x: torch.Tensor, raw_mask: torch.Tensor, stat_x: torch.Tensor) -> torch.Tensor:
-        self.patch_hook.clear()
-        patch_out = self.patchtst(raw_x, raw_mask)
-        emb = self.patch_hook.value
+        self.temporal_hook.clear()
+        temporal_out = self.temporal_model(raw_x, raw_mask)
+        emb = self.temporal_hook.value
         if emb is None:
-            emb = compat_alarm_logit(patch_out).reshape(raw_x.shape[0], -1)
+            emb = compat_alarm_logit(temporal_out).reshape(raw_x.shape[0], -1)
         if emb.ndim > 2:
             emb = emb.flatten(start_dim=1)
         if emb.ndim == 1:
@@ -285,7 +297,7 @@ class PatchTSTStatAligner(nn.Module):
         return self.classifier(fused).squeeze(-1)
 
 
-def initialize_lazy_layers(model: PatchTSTStatAligner, dataset: SelectedWindowStatDataset, cfg: CompatCfg) -> None:
+def initialize_lazy_layers(model: TemporalStatAligner, dataset: SelectedWindowStatDataset, cfg: CompatCfg) -> None:
     loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=0)
     try:
         raw_x, raw_m, stat_x, _ys, _ws = next(iter(loader))
@@ -308,7 +320,7 @@ def train_fusion_encoder(
     stat_indices: list[int],
     args: argparse.Namespace,
     fold: int,
-) -> tuple[PatchTSTStatAligner, CompatBatchedDataset, dict[str, Any]]:
+) -> tuple[TemporalStatAligner, CompatBatchedDataset, dict[str, Any]]:
     started = log_stage_start(
         "build_fusion_dataset",
         RUN_NAME,
@@ -328,7 +340,8 @@ def train_fusion_encoder(
         pos=int(base_dataset.pos_rows),
         neg=int(base_dataset.neg_rows),
     )
-    model = PatchTSTStatAligner(
+    model = TemporalStatAligner(
+        temporal_encoder=args.temporal_encoder,
         seq_len=cfg.seq_len,
         n_raw_features=len(raw_indices),
         n_stat_features=len(stat_indices),
@@ -435,7 +448,7 @@ def train_fusion_encoder(
 
 @torch.no_grad()
 def encode_file_positions(
-    model: PatchTSTStatAligner,
+    model: TemporalStatAligner,
     cache: Model2FeatureCache,
     file_name: str,
     cfg: CompatCfg,
@@ -495,7 +508,7 @@ def encode_file_positions(
 
 
 def score_selected_positions(
-    model: PatchTSTStatAligner,
+    model: TemporalStatAligner,
     cache: Model2FeatureCache,
     dataset: CompatBatchedDataset,
     cfg: CompatCfg,
@@ -510,7 +523,7 @@ def score_selected_positions(
 
 
 def collect_fused_training_table(
-    model: PatchTSTStatAligner,
+    model: TemporalStatAligner,
     cache: Model2FeatureCache,
     dataset: CompatBatchedDataset,
     cfg: CompatCfg,
@@ -605,7 +618,7 @@ def build_aligned_xgb_model(args: argparse.Namespace, y_train: np.ndarray, seed:
 
 def score_fused_files_to_memory(
     estimator: Any,
-    model: PatchTSTStatAligner,
+    model: TemporalStatAligner,
     cache: Model2FeatureCache,
     file_names: list[str],
     cfg: CompatCfg,
@@ -707,8 +720,9 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
     run_dir = Path(args.out_root) / RUN_NAME / f"fold_{fold}"
     run_dir.mkdir(parents=True, exist_ok=True)
     log_run_header(
-        "PATCHTST STAT-ALIGNED CROSS-ATTENTION XGB",
+        "TSF-XGBOOST TEMPORAL-STAT ALIGNMENT",
         {
+            "temporal encoder": args.temporal_encoder,
             "fold": fold,
             "train/val/test": f"{len(train_files)}/{len(val_files)}/{len(test_files)} modules",
             "target": cfg.target_mode,
@@ -737,6 +751,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
     (run_dir / "feature_groups.json").write_text(
         json.dumps(
             {
+                "temporal_encoder": args.temporal_encoder,
                 "raw_sequence_features": raw_names,
                 "statistic_features": stat_names,
                 "all_compat_features": names,
@@ -750,7 +765,9 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         {
             "state_dict": model.state_dict(),
             "cfg": asdict(cfg),
-            "patchtst_cfg": model.patchtst_cfg,
+            "temporal_encoder": args.temporal_encoder,
+            "temporal_encoder_cfg": model.temporal_encoder_cfg,
+            "patchtst_cfg": model.temporal_encoder_cfg if str(args.temporal_encoder) == "patchtst" else None,
             "raw_features": raw_names,
             "stat_features": stat_names,
             "fusion_mode": args.fusion_mode,
@@ -802,6 +819,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
             bool(args.threshold_search),
             metadata={
                 "run_name": RUN_NAME,
+                "temporal_encoder": args.temporal_encoder,
                 "mode": "aligned_latent_xgb",
                 "feature_mode": args.feature_mode,
                 "stat_feature_mode": args.stat_feature_mode,
@@ -816,6 +834,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
     print(f"[aligned-done] fold={fold} threshold={threshold:.4f} rows={test_rows} {format_metric_summary(metrics)}", flush=True)
     result = {
         "deep_model": RUN_NAME,
+        "temporal_encoder": args.temporal_encoder,
         "fold": int(fold),
         "mode": "aligned_latent_xgb",
         "ml_model": "xgb",
@@ -846,6 +865,7 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
     for item in results:
         row = {
             "deep_model": item["deep_model"],
+            "temporal_encoder": item.get("temporal_encoder", getattr(args, "temporal_encoder", "")),
             "fold": int(item["fold"]),
             "mode": item["mode"],
             "ml_model": item.get("ml_model", ""),
@@ -879,6 +899,7 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
         frame.drop_duplicates(
             subset=[
                 "deep_model",
+                "temporal_encoder",
                 "fold",
                 "mode",
                 "stat_feature_mode",
@@ -895,6 +916,7 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
     frame.to_csv(path, index=False)
     group_cols = [
         "deep_model",
+        "temporal_encoder",
         "mode",
         "target_mode",
         "feature_mode",
@@ -915,7 +937,15 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="PatchTST + statistic MLP feature alignment + cross-attention + XGBoost.")
+    parser = argparse.ArgumentParser(
+        description="Temporal encoder + statistic MLP feature alignment + cross-attention + XGBoost."
+    )
+    parser.add_argument(
+        "--temporal_encoder",
+        choices=list(TEMPORAL_ENCODERS),
+        default="patchtst",
+        help="Temporal branch backbone used inside the TSF-XGBoost framework.",
+    )
     parser.add_argument("--folds", nargs="+", type=int, default=[1])
     parser.add_argument("--data_dir", type=Path, default=Path("dataset/training"))
     parser.add_argument("--index_path", type=Path, default=Path("dataset/train_test_set_index(in).csv"))
@@ -993,7 +1023,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global RUN_NAME
     args = parse_args()
+    args.temporal_encoder = str(args.temporal_encoder).lower()
+    RUN_NAME = tsf_run_name(args.temporal_encoder)
     if str(args.gpu_id).strip():
         import os
 

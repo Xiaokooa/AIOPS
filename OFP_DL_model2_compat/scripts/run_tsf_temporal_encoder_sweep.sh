@@ -2,57 +2,23 @@
 set -euo pipefail
 
 GPU_ID="${GPU_ID:-0}"
-FOLDS="${FOLDS:-1 2 3}"
-OUT_ROOT="${OUT_ROOT:-OFP_DL_model2_compat_results/tsf_table5_ablation}"
-TSF_VARIANTS="${TSF_VARIANTS:-all}"
-TEMPORAL_ENCODER="${TEMPORAL_ENCODER:-patchtst}"
-MAX_TRAIN_FILES="${MAX_TRAIN_FILES:-0}"
-MAX_TEST_FILES="${MAX_TEST_FILES:-0}"
+FOLDS="${FOLDS:-1}"
+TEMPORAL_ENCODERS="${TEMPORAL_ENCODERS:-itransformer moderntcn fits}"
+OUT_ROOT="${OUT_ROOT:-OFP_DL_model2_compat_results/tsf_temporal_encoder_sweep}"
+MAX_TRAIN_FILES="${MAX_TRAIN_FILES:-2500}"
+MAX_TEST_FILES="${MAX_TEST_FILES:-1200}"
 N_JOBS="${N_JOBS:-4}"
 
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
-if [[ "${TSF_VARIANTS}" == "all" ]]; then
-  VARIANT_LIST="full no_stat_branch no_temporal_branch no_cross_attention no_gated_fusion"
-else
-  VARIANT_LIST="${TSF_VARIANTS}"
-fi
-
-for variant in ${VARIANT_LIST}; do
-  case "${variant}" in
-    full)
-      TSF_ABLATION="full"
-      FUSION_MODE="gated_attn"
-      ;;
-    no_stat_branch)
-      TSF_ABLATION="no_stat_branch"
-      FUSION_MODE="gated_attn"
-      ;;
-    no_temporal_branch)
-      TSF_ABLATION="no_temporal_branch"
-      FUSION_MODE="gated_attn"
-      ;;
-    no_cross_attention)
-      TSF_ABLATION="no_cross_attention"
-      FUSION_MODE="gated_attn"
-      ;;
-    no_gated_fusion)
-      TSF_ABLATION="full"
-      FUSION_MODE="attn_mean"
-      ;;
-    *)
-      echo "Unknown TSF variant: ${variant}" >&2
-      exit 2
-      ;;
-  esac
-
+for encoder in ${TEMPORAL_ENCODERS}; do
   echo "========================================================================"
-  echo "[table5] encoder=${TEMPORAL_ENCODER} variant=${variant} folds=${FOLDS} out_root=${OUT_ROOT}"
+  echo "[encoder-sweep] encoder=${encoder} folds=${FOLDS} out_root=${OUT_ROOT}"
   echo "========================================================================"
 
   # shellcheck disable=SC2086
   python -u -B OFP_DL_model2_compat/run_patchtst_stat_aligned_xgb.py \
-    --temporal_encoder "${TEMPORAL_ENCODER}" \
+    --temporal_encoder "${encoder}" \
     --folds ${FOLDS} \
     --device cuda \
     --out_root "${OUT_ROOT}" \
@@ -61,8 +27,8 @@ for variant in ${VARIANT_LIST}; do
     --batch_size 192 \
     --feature_mode model2_plus \
     --stat_feature_mode all_engineered \
-    --fusion_mode "${FUSION_MODE}" \
-    --tsf_ablation "${TSF_ABLATION}" \
+    --fusion_mode gated_attn \
+    --tsf_ablation full \
     --sampling_mode module_balanced \
     --rule_mode none \
     --sample_selection hybrid \

@@ -1,17 +1,30 @@
-# PatchTST Statistic-Aligned Fusion and XGB DRAM Ablation
+# TSF-XGBoost Temporal Encoder and Protocol Ablations
 
 This note records two experimental entry points added for quick validation.
 
-## 1. PatchTST + statistic MLP + feature alignment + cross-attention + XGBoost
+## 1. Temporal encoder + statistic MLP + feature alignment + cross-attention + XGBoost
 
 The script avoids direct feature concatenation into XGBoost. It trains a supervised
 fusion encoder first:
 
 ```text
-raw telemetry window -> PatchTST -> projected embedding(256) -> latent(128)
+raw telemetry window -> temporal encoder -> projected embedding(256) -> latent(128)
 engineered/statistical features -> MLP -> latent(128)
 two latent tokens -> feature alignment -> cross-attention/gated fusion -> fused latent(128)
 fused latent -> XGBoost
+```
+
+The default temporal encoder is PatchTST. The same TSF-XGBoost framework can
+also replace the temporal branch with iTransformer, ModernTCN, or FITS:
+
+```bash
+GPU_ID=1 FOLDS="1" bash OFP_DL_model2_compat/scripts/run_tsf_temporal_encoder_sweep.sh
+```
+
+To include PatchTST in the same sweep:
+
+```bash
+GPU_ID=1 FOLDS="1" TEMPORAL_ENCODERS="patchtst itransformer moderntcn fits" bash OFP_DL_model2_compat/scripts/run_tsf_temporal_encoder_sweep.sh
 ```
 
 Quick one-fold command:
@@ -31,6 +44,7 @@ Direct Python command:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 python -u -B OFP_DL_model2_compat/run_patchtst_stat_aligned_xgb.py \
+  --temporal_encoder patchtst \
   --folds 1 \
   --device cuda \
   --out_root OFP_DL_model2_compat_results/patchtst_stat_aligned_xgb_quick_fold1 \
@@ -60,6 +74,7 @@ Useful diagnostic switches:
 
 - `--fusion_mode gated_attn` uses modality gating after cross-attention.
 - `--fusion_mode attn_mean` reproduces the earlier mean-pooling fusion.
+- `--temporal_encoder patchtst|itransformer|moderntcn|fits` replaces the temporal branch while keeping the TSF-XGBoost framework fixed.
 - `--rule_mode none` evaluates the latent XGBoost without rule OR.
 - `--xgb_balance_mode none --no_xgb_sample_weight` removes duplicate class/row weighting.
 - `--stat_feature_mode model2_expert` tests only OFP expert relational features.
@@ -81,6 +96,12 @@ requirement:
 GPU_ID=1 FOLDS="1 2 3" bash OFP_DL_model2_compat/scripts/run_patchtst_stat_aligned_xgb_lead_sweep.sh
 ```
 
+Use another temporal encoder under the same lead-time protocol:
+
+```bash
+GPU_ID=1 TEMPORAL_ENCODER=itransformer FOLDS="1 2 3" bash OFP_DL_model2_compat/scripts/run_patchtst_stat_aligned_xgb_lead_sweep.sh
+```
+
 Default grid: `1m,5m,15m,30m,1h,2h,5h,12h,24h`.
 
 Main outputs:
@@ -89,7 +110,7 @@ Main outputs:
 - `lead_time_sweep_mean_std.csv`
 - `patchtst_stat_aligned_xgb/fold_*/lead_time_sweep/aligned_latent_xgb/lead_time_sweep.csv`
 
-## 2. XGBoost-only DRAM-inspired ablation
+## 2. XGBoost-only protocol ablation
 
 The ablation fixes the final classifier as XGBoost and opens the improvements
 cumulatively:
