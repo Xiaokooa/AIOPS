@@ -77,6 +77,8 @@ RAW_SEQUENCE_FEATURES = [
     "TxP3",
     "TxP4",
 ]
+TEMPORAL_SUMMARY_MODES = ("none", "raw_channel_stats")
+TEMPORAL_SUMMARY_OPS = ("last", "mean", "std", "min", "max", "delta", "range")
 
 
 def tsf_run_name(temporal_encoder: str) -> str:
@@ -133,6 +135,82 @@ def feature_indices(feature_names: list[str], stat_feature_mode: str) -> tuple[l
         stat_names = [name for name in feature_names if name not in raw_set]
     stat_indices = [feature_names.index(name) for name in stat_names]
     return raw_indices, raw_names, stat_indices, stat_names
+
+
+def temporal_summary_feature_names(raw_names: list[str], temporal_summary_mode: str) -> list[str]:
+    mode = str(temporal_summary_mode).lower()
+    if mode == "none":
+        return []
+    if mode != "raw_channel_stats":
+        raise ValueError(f"Unknown temporal_summary_mode={temporal_summary_mode!r}; use one of {TEMPORAL_SUMMARY_MODES}")
+    return [f"TemporalSummary_{name}_{op}" for name in raw_names for op in TEMPORAL_SUMMARY_OPS]
+
+
+def stat_candidate_names(stat_names: list[str], raw_names: list[str], temporal_summary_mode: str) -> list[str]:
+    return list(stat_names) + temporal_summary_feature_names(raw_names, temporal_summary_mode)
+
+
+def compute_temporal_window_summaries(
+    raw: np.ndarray,
+    positions: np.ndarray,
+    seq_len: int,
+    temporal_summary_mode: str,
+) -> np.ndarray:
+    mode = str(temporal_summary_mode).lower()
+    positions = np.asarray(positions, dtype=np.int64)
+    if mode == "none":
+        return np.zeros((len(positions), 0), dtype=np.float32)
+    if mode != "raw_channel_stats":
+        raise ValueError(f"Unknown temporal_summary_mode={temporal_summary_mode!r}; use one of {TEMPORAL_SUMMARY_MODES}")
+    raw = np.asarray(raw, dtype=np.float32)
+    n_channels = int(raw.shape[1]) if raw.ndim == 2 else 0
+    out = np.zeros((len(positions), n_channels * len(TEMPORAL_SUMMARY_OPS)), dtype=np.float32)
+    for row_idx, pos in enumerate(positions):
+        pos = int(pos)
+        if pos < 0 or pos >= len(raw):
+            continue
+        start = max(0, pos - int(seq_len) + 1)
+        window = raw[start : pos + 1]
+        if len(window) == 0:
+            continue
+        window = np.nan_to_num(window, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        last = window[-1]
+        mean = window.mean(axis=0)
+        std = window.std(axis=0)
+        min_value = window.min(axis=0)
+        max_value = window.max(axis=0)
+        delta = last - window[0]
+        value_range = max_value - min_value
+        channel_major = np.stack([last, mean, std, min_value, max_value, delta, value_range], axis=1)
+        out[row_idx] = channel_major.reshape(-1)
+    return np.nan_to_num(out, copy=False, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+def build_stat_candidate_matrix(
+    features: np.ndarray,
+    positions: np.ndarray,
+    raw_indices: np.ndarray | list[int],
+    stat_indices: np.ndarray | list[int],
+    seq_len: int,
+    temporal_summary_mode: str,
+) -> np.ndarray:
+    positions = np.asarray(positions, dtype=np.int64)
+    stat_idx = np.asarray(stat_indices, dtype=np.int64)
+    raw_idx = np.asarray(raw_indices, dtype=np.int64)
+    base = (
+        features[positions][:, stat_idx].astype(np.float32)
+        if len(stat_idx) > 0
+        else np.zeros((len(positions), 0), dtype=np.float32)
+    )
+    temporal = compute_temporal_window_summaries(
+        features[:, raw_idx].astype(np.float32),
+        positions,
+        int(seq_len),
+        temporal_summary_mode,
+    )
+    if temporal.shape[1] == 0:
+        return base
+    return np.concatenate([base, temporal], axis=1).astype(np.float32)
 
 
 def _save_score_table(path: Path, names: list[str], scores: np.ndarray, score_name: str = "score") -> pd.DataFrame:
@@ -201,41 +279,59 @@ def _cap_explain_rows(x: np.ndarray, y: np.ndarray, max_rows: int, seed: int) ->
 def maybe_select_stat_features(
     cache: Model2FeatureCache,
     base_dataset: CompatBatchedDataset,
+    cfg: CompatCfg,
+    raw_indices: list[int],
+    raw_names: list[str],
     stat_indices: list[int],
     stat_names: list[str],
     args: argparse.Namespace,
     fold: int,
     run_dir: Path,
-) -> tuple[list[int], list[str], dict[str, Any]]:
+) -> tuple[list[int], list[str], dict[str, Any], list[str]]:
     selector_name = str(args.stat_selector).lower()
     k = int(args.stat_select_k)
+    candidate_names = stat_candidate_names(stat_names, raw_names, str(args.temporal_summary_mode))
+    temporal_summary_count = len(candidate_names) - len(stat_names)
     meta: dict[str, Any] = {
         "stat_selector": selector_name,
         "requested_stat_select_k": k,
-        "original_stat_feature_count": len(stat_indices),
+        "base_stat_feature_count": len(stat_indices),
+        "temporal_summary_mode": str(args.temporal_summary_mode),
+        "temporal_summary_feature_count": int(temporal_summary_count),
+        "original_stat_feature_count": len(candidate_names),
     }
-    if selector_name == "none" or k <= 0 or k >= len(stat_indices):
-        meta["selected_stat_feature_count"] = len(stat_indices)
-        return stat_indices, stat_names, meta
+    all_local_indices = list(range(len(candidate_names)))
+    if selector_name == "none" or k <= 0 or k >= len(candidate_names):
+        meta["selected_stat_feature_count"] = len(candidate_names)
+        return all_local_indices, candidate_names, meta, candidate_names
     x_parts: list[np.ndarray] = []
     y_parts: list[np.ndarray] = []
     for name, selected in zip(base_dataset.file_names, base_dataset.selected_positions):
         if len(selected) <= 0:
             continue
         _ts, features, _valid_mask, labels, _anomaly_labels, _rule_pred, _extra = cache.get(name)
-        x_parts.append(features[selected][:, np.asarray(stat_indices, dtype=np.int64)].astype(np.float32))
+        x_parts.append(
+            build_stat_candidate_matrix(
+                features,
+                selected,
+                raw_indices,
+                stat_indices,
+                int(cfg.seq_len),
+                str(args.temporal_summary_mode),
+            )
+        )
         y_parts.append(labels[selected].astype(np.int8))
     if not x_parts:
-        meta["selected_stat_feature_count"] = len(stat_indices)
+        meta["selected_stat_feature_count"] = len(candidate_names)
         meta["reason"] = "empty_training_selection"
-        return stat_indices, stat_names, meta
+        return all_local_indices, candidate_names, meta, candidate_names
     x = np.concatenate(x_parts, axis=0)
     y = np.concatenate(y_parts, axis=0)
     x, y = _cap_explain_rows(x, y, int(args.stat_selector_max_rows), int(args.seed) + int(fold))
     if len(np.unique(y)) < 2:
-        meta["selected_stat_feature_count"] = len(stat_indices)
+        meta["selected_stat_feature_count"] = len(candidate_names)
         meta["reason"] = "single_class_training_selection"
-        return stat_indices, stat_names, meta
+        return all_local_indices, candidate_names, meta, candidate_names
     selector = ExtraTreesClassifier(
         n_estimators=int(args.stat_selector_estimators),
         random_state=int(args.seed) + int(fold),
@@ -247,9 +343,14 @@ def maybe_select_stat_features(
     scores = np.asarray(selector.feature_importances_, dtype=float)
     ranking = np.argsort(scores)[::-1]
     local = ranking[: min(k, len(ranking))]
-    selected_indices = [stat_indices[int(i)] for i in local]
-    selected_names = [stat_names[int(i)] for i in local]
-    importance = _save_score_table(run_dir / "explainability" / "stat_feature_importance.csv", stat_names, scores, "importance")
+    selected_indices = [int(i) for i in local]
+    selected_names = [candidate_names[int(i)] for i in local]
+    importance = _save_score_table(
+        run_dir / "explainability" / "stat_feature_importance.csv",
+        candidate_names,
+        scores,
+        "importance",
+    )
     _save_topk_heatmap(run_dir / "explainability" / "stat_feature_importance_topk_heatmap.png", importance, "importance")
     meta.update(
         {
@@ -263,7 +364,7 @@ def maybe_select_stat_features(
         pd.DataFrame({"feature": selected_names}).to_csv(index=False),
         encoding="utf-8",
     )
-    return selected_indices, selected_names, meta
+    return selected_indices, selected_names, meta, candidate_names
 
 
 class SelectedWindowStatDataset(IterableDataset):
@@ -274,12 +375,16 @@ class SelectedWindowStatDataset(IterableDataset):
         cfg: CompatCfg,
         raw_indices: list[int],
         stat_indices: list[int],
+        stat_input_indices: list[int],
+        temporal_summary_mode: str,
     ) -> None:
         self.base = base
         self.cache = cache
         self.cfg = cfg
         self.raw_indices = np.asarray(raw_indices, dtype=np.int64)
         self.stat_indices = np.asarray(stat_indices, dtype=np.int64)
+        self.stat_input_indices = np.asarray(stat_input_indices, dtype=np.int64)
+        self.temporal_summary_mode = str(temporal_summary_mode)
 
     def __len__(self) -> int:
         return len(self.base)
@@ -304,7 +409,15 @@ class SelectedWindowStatDataset(IterableDataset):
                 continue
             _ts, features, _valid_mask, labels, _anomaly_labels, _rule_pred, _extra = self.cache.get(name)
             raw = features[:, self.raw_indices].astype(np.float32)
-            stat = features[:, self.stat_indices].astype(np.float32)
+            stat = build_stat_candidate_matrix(
+                features,
+                selected,
+                self.raw_indices,
+                self.stat_indices,
+                seq_len,
+                self.temporal_summary_mode,
+            )
+            stat = stat[:, self.stat_input_indices].astype(np.float32)
             pad_x = np.zeros((seq_len - 1, raw.shape[1]), dtype=np.float32)
             pad_m = np.zeros_like(pad_x)
             x_pad = torch.from_numpy(np.concatenate([pad_x, raw], axis=0))
@@ -313,7 +426,7 @@ class SelectedWindowStatDataset(IterableDataset):
             m_windows = m_pad.unfold(0, seq_len, 1).permute(0, 2, 1)
             ys = torch.from_numpy(labels[selected].astype(np.float32))
             ws = torch.from_numpy(weight_by_name.get(name, np.ones(len(selected), dtype=np.float32)).astype(np.float32))
-            stat_tensor = torch.from_numpy(stat[selected].astype(np.float32))
+            stat_tensor = torch.from_numpy(stat.astype(np.float32))
             for start in range(0, len(selected), int(self.cfg.batch_size)):
                 end = start + int(self.cfg.batch_size)
                 idx = torch.from_numpy(np.asarray(selected[start:end], dtype=np.int64))
@@ -476,12 +589,13 @@ def train_fusion_encoder(
     cache: Model2FeatureCache,
     cfg: CompatCfg,
     raw_indices: list[int],
+    raw_names: list[str],
     stat_indices: list[int],
     stat_names: list[str],
     args: argparse.Namespace,
     fold: int,
     run_dir: Path,
-) -> tuple[TemporalStatAligner, CompatBatchedDataset, dict[str, Any], list[int], list[str]]:
+) -> tuple[TemporalStatAligner, CompatBatchedDataset, dict[str, Any], list[int], list[str], list[str]]:
     started = log_stage_start(
         "build_fusion_dataset",
         RUN_NAME,
@@ -491,16 +605,27 @@ def train_fusion_encoder(
         sampling_mode=cfg.sampling_mode,
     )
     base_dataset = CompatBatchedDataset(train_files, cache, cfg)
-    stat_indices, stat_names, stat_selector_meta = maybe_select_stat_features(
+    stat_input_indices, stat_input_names, stat_selector_meta, stat_candidate_feature_names = maybe_select_stat_features(
         cache,
         base_dataset,
+        cfg,
+        raw_indices,
+        raw_names,
         stat_indices,
         stat_names,
         args,
         fold,
         run_dir,
     )
-    fusion_dataset = SelectedWindowStatDataset(base_dataset, cache, cfg, raw_indices, stat_indices)
+    fusion_dataset = SelectedWindowStatDataset(
+        base_dataset,
+        cache,
+        cfg,
+        raw_indices,
+        stat_indices,
+        stat_input_indices,
+        str(args.temporal_summary_mode),
+    )
     log_stage_done(
         "build_fusion_dataset",
         started,
@@ -514,7 +639,7 @@ def train_fusion_encoder(
         temporal_encoder=args.temporal_encoder,
         seq_len=cfg.seq_len,
         n_raw_features=len(raw_indices),
-        n_stat_features=len(stat_indices),
+        n_stat_features=len(stat_input_indices),
         embedding_dim=args.seq_embedding_dim,
         latent_dim=args.latent_dim,
         stat_hidden=args.stat_hidden,
@@ -593,7 +718,16 @@ def train_fusion_encoder(
             and epoch < int(cfg.epochs)
         ):
             score_started = log_stage_start("adaptive_negative_weight", RUN_NAME, fold, after_epoch=epoch)
-            scores = score_selected_positions(model, cache, base_dataset, cfg, raw_indices, stat_indices)
+            scores = score_selected_positions(
+                model,
+                cache,
+                base_dataset,
+                cfg,
+                raw_indices,
+                stat_indices,
+                stat_input_indices,
+                str(args.temporal_summary_mode),
+            )
             adaptive_meta = base_dataset.apply_adaptive_negative_weights(scores, float(cfg.adaptive_negative_weight))
             adaptive_meta["applied_after_epoch"] = float(epoch)
             adaptive_applied = True
@@ -614,7 +748,7 @@ def train_fusion_encoder(
         "adaptive_negative_weight_meta": adaptive_meta,
         "stat_feature_selection": stat_selector_meta,
     }
-    return model, base_dataset, meta, stat_indices, stat_names
+    return model, base_dataset, meta, stat_input_indices, stat_input_names, stat_candidate_feature_names
 
 
 @torch.no_grad()
@@ -625,6 +759,8 @@ def encode_file_positions(
     cfg: CompatCfg,
     raw_indices: list[int],
     stat_indices: list[int],
+    stat_input_indices: list[int],
+    temporal_summary_mode: str,
     positions: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     model.eval()
@@ -646,8 +782,16 @@ def encode_file_positions(
             "extra": extra,
         }
     raw = features[:, np.asarray(raw_indices, dtype=np.int64)].astype(np.float32)
-    stat = features[:, np.asarray(stat_indices, dtype=np.int64)].astype(np.float32)
     seq_len = int(cfg.seq_len)
+    stat = build_stat_candidate_matrix(
+        features,
+        positions,
+        raw_indices,
+        stat_indices,
+        seq_len,
+        temporal_summary_mode,
+    )
+    stat = stat[:, np.asarray(stat_input_indices, dtype=np.int64)].astype(np.float32)
     pad_x = np.zeros((seq_len - 1, raw.shape[1]), dtype=np.float32)
     pad_m = np.zeros_like(pad_x)
     x_pad = torch.from_numpy(np.concatenate([pad_x, raw], axis=0))
@@ -661,7 +805,7 @@ def encode_file_positions(
         idx = torch.from_numpy(batch_pos.astype(np.int64))
         raw_x = x_windows.index_select(0, idx).contiguous().to(cfg.device)
         raw_m = m_windows.index_select(0, idx).contiguous().to(cfg.device)
-        stat_x = torch.from_numpy(stat[batch_pos].astype(np.float32)).to(cfg.device)
+        stat_x = torch.from_numpy(stat[start : start + len(batch_pos)].astype(np.float32)).to(cfg.device)
         with cuda_autocast(bool(cfg.amp) and str(cfg.device).startswith("cuda")):
             fused = model.encode(raw_x, raw_m, stat_x)
             logits = model.classifier(fused).squeeze(-1)
@@ -685,10 +829,22 @@ def score_selected_positions(
     cfg: CompatCfg,
     raw_indices: list[int],
     stat_indices: list[int],
+    stat_input_indices: list[int],
+    temporal_summary_mode: str,
 ) -> dict[str, np.ndarray]:
     out: dict[str, np.ndarray] = {}
     for file_name, positions in zip(dataset.file_names, dataset.selected_positions):
-        block = encode_file_positions(model, cache, file_name, cfg, raw_indices, stat_indices, positions)
+        block = encode_file_positions(
+            model,
+            cache,
+            file_name,
+            cfg,
+            raw_indices,
+            stat_indices,
+            stat_input_indices,
+            temporal_summary_mode,
+            positions,
+        )
         out[file_name] = (1.0 / (1.0 + np.exp(-block["logits"]))).astype(np.float32)
     return out
 
@@ -700,6 +856,8 @@ def collect_fused_training_table(
     cfg: CompatCfg,
     raw_indices: list[int],
     stat_indices: list[int],
+    stat_input_indices: list[int],
+    temporal_summary_mode: str,
     fold: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
     x_parts: list[np.ndarray] = []
@@ -710,7 +868,17 @@ def collect_fused_training_table(
     for idx, (file_name, positions) in enumerate(zip(dataset.file_names, dataset.selected_positions), 1):
         if len(positions) == 0:
             continue
-        block = encode_file_positions(model, cache, file_name, cfg, raw_indices, stat_indices, positions)
+        block = encode_file_positions(
+            model,
+            cache,
+            file_name,
+            cfg,
+            raw_indices,
+            stat_indices,
+            stat_input_indices,
+            temporal_summary_mode,
+            positions,
+        )
         x_parts.append(block["fused"])
         y_parts.append(block["labels"])
         w_parts.append(weight_by_name.get(file_name, np.ones(len(positions), dtype=np.float32)).astype(np.float32))
@@ -761,6 +929,7 @@ def summarize_tsf_explainability(
     cfg: CompatCfg,
     raw_indices: list[int],
     stat_indices: list[int],
+    stat_input_indices: list[int],
     raw_names: list[str],
     stat_names: list[str],
     run_dir: Path,
@@ -772,7 +941,15 @@ def summarize_tsf_explainability(
     started = time.time()
     explain_dir = run_dir / "explainability"
     explain_dir.mkdir(parents=True, exist_ok=True)
-    explain_dataset = SelectedWindowStatDataset(dataset, cache, cfg, raw_indices, stat_indices)
+    explain_dataset = SelectedWindowStatDataset(
+        dataset,
+        cache,
+        cfg,
+        raw_indices,
+        stat_indices,
+        stat_input_indices,
+        str(args.temporal_summary_mode),
+    )
     loader = DataLoader(explain_dataset, batch_size=None, shuffle=False, num_workers=0)
     model.eval()
     rows_seen = 0
@@ -929,13 +1106,24 @@ def score_fused_files_to_memory(
     cfg: CompatCfg,
     raw_indices: list[int],
     stat_indices: list[int],
+    stat_input_indices: list[int],
+    temporal_summary_mode: str,
     fold: int,
     stage_name: str,
 ) -> dict[str, pd.DataFrame]:
     frames: dict[str, pd.DataFrame] = {}
     started = log_stage_start(stage_name, RUN_NAME, fold, files=len(file_names))
     for idx, file_name in enumerate(file_names, 1):
-        block = encode_file_positions(model, cache, file_name, cfg, raw_indices, stat_indices)
+        block = encode_file_positions(
+            model,
+            cache,
+            file_name,
+            cfg,
+            raw_indices,
+            stat_indices,
+            stat_input_indices,
+            temporal_summary_mode,
+        )
         score = positive_scores(estimator, block["fused"])
         parts = [
             pd.DataFrame(
@@ -1033,6 +1221,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
             "target": cfg.target_mode,
             "feature mode": cfg.feature_mode,
             "stat features": args.stat_feature_mode,
+            "temporal summaries": args.temporal_summary_mode,
             "fusion mode": args.fusion_mode,
             "tsf ablation": args.tsf_ablation,
             "rule mode": cfg.rule_mode,
@@ -1053,12 +1242,14 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
     cache = Model2FeatureCache(args.data_dir, mean, std, cfg, label_by_file)
     names = compat_feature_names(cfg)
     raw_indices, raw_names, stat_indices, stat_names = feature_indices(names, args.stat_feature_mode)
-    original_stat_feature_count = len(stat_names)
-    model, dataset, train_meta, stat_indices, stat_names = train_fusion_encoder(
+    stat_candidate_feature_names = stat_candidate_names(stat_names, raw_names, str(args.temporal_summary_mode))
+    original_stat_feature_count = len(stat_candidate_feature_names)
+    model, dataset, train_meta, stat_input_indices, stat_input_names, stat_candidate_feature_names = train_fusion_encoder(
         train_files,
         cache,
         cfg,
         raw_indices,
+        raw_names,
         stat_indices,
         stat_names,
         args,
@@ -1070,12 +1261,18 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
             {
                 "temporal_encoder": args.temporal_encoder,
                 "raw_sequence_features": raw_names,
-                "statistic_features": stat_names,
+                "base_statistic_features": stat_names,
+                "statistic_feature_candidates": stat_candidate_feature_names,
+                "statistic_features": stat_input_names,
+                "temporal_summary_mode": args.temporal_summary_mode,
+                "temporal_summary_features": temporal_summary_feature_names(raw_names, str(args.temporal_summary_mode)),
                 "feature_group_counts": {
                     "raw_sequence_features": len(raw_names),
                     "raw_sequence_window_values": len(raw_names) * int(cfg.seq_len),
+                    "base_statistic_features": len(stat_names),
+                    "temporal_summary_features": len(stat_candidate_feature_names) - len(stat_names),
                     "statistic_features_original": original_stat_feature_count,
-                    "statistic_features_used": len(stat_names),
+                    "statistic_features_used": len(stat_input_names),
                     "temporal_latent_dim": int(args.latent_dim),
                     "statistic_latent_dim": int(args.latent_dim),
                     "fused_latent_dim": int(args.latent_dim),
@@ -1095,7 +1292,11 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
             "temporal_encoder_cfg": model.temporal_encoder_cfg,
             "patchtst_cfg": model.temporal_encoder_cfg if str(args.temporal_encoder) == "patchtst" else None,
             "raw_features": raw_names,
-            "stat_features": stat_names,
+            "base_stat_features": stat_names,
+            "stat_feature_candidates": stat_candidate_feature_names,
+            "stat_features": stat_input_names,
+            "stat_input_indices": stat_input_indices,
+            "temporal_summary_mode": args.temporal_summary_mode,
             "fusion_mode": args.fusion_mode,
             "tsf_ablation": args.tsf_ablation,
             "train_meta": train_meta,
@@ -1103,7 +1304,15 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         run_dir / "aligned_encoder.pt",
     )
     x_train, y_train, sample_weight, latent_names = collect_fused_training_table(
-        model, cache, dataset, cfg, raw_indices, stat_indices, int(fold)
+        model,
+        cache,
+        dataset,
+        cfg,
+        raw_indices,
+        stat_indices,
+        stat_input_indices,
+        str(args.temporal_summary_mode),
+        int(fold),
     )
     summarize_tsf_explainability(
         model,
@@ -1112,8 +1321,9 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         cfg,
         raw_indices,
         stat_indices,
+        stat_input_indices,
         raw_names,
-        stat_names,
+        stat_input_names,
         run_dir,
         args,
     )
@@ -1136,8 +1346,32 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
     save_xgb_latent_importance(estimator, latent_names, run_dir)
     with (run_dir / "xgb_fused_latent.pkl").open("wb") as fh:
         pickle.dump({"model": estimator, "feature_names": latent_names, "xgb_meta": xgb_meta}, fh)
-    val_scores = score_fused_files_to_memory(estimator, model, cache, val_files, cfg, raw_indices, stat_indices, int(fold), "score_val_files")
-    test_scores = score_fused_files_to_memory(estimator, model, cache, test_files, cfg, raw_indices, stat_indices, int(fold), "score_test_files")
+    val_scores = score_fused_files_to_memory(
+        estimator,
+        model,
+        cache,
+        val_files,
+        cfg,
+        raw_indices,
+        stat_indices,
+        stat_input_indices,
+        str(args.temporal_summary_mode),
+        int(fold),
+        "score_val_files",
+    )
+    test_scores = score_fused_files_to_memory(
+        estimator,
+        model,
+        cache,
+        test_files,
+        cfg,
+        raw_indices,
+        stat_indices,
+        stat_input_indices,
+        str(args.temporal_summary_mode),
+        int(fold),
+        "score_test_files",
+    )
     threshold, val_metrics = select_threshold_for_scores(val_scores, args.data_dir, run_dir, "aligned_latent_xgb", args)
     pred_dir = run_dir / "predictions" / "aligned_latent_xgb"
     eval_dir = run_dir / "evaluation" / "aligned_latent_xgb"
@@ -1162,6 +1396,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
                 "mode": "aligned_latent_xgb",
                 "feature_mode": args.feature_mode,
                 "stat_feature_mode": args.stat_feature_mode,
+                "temporal_summary_mode": args.temporal_summary_mode,
                 "fusion_mode": args.fusion_mode,
                 "tsf_ablation": args.tsf_ablation,
                 "rule_mode": cfg.rule_mode,
@@ -1188,7 +1423,8 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         "threshold": float(threshold),
         "stat_selector": args.stat_selector,
         "stat_select_k": int(args.stat_select_k),
-        "stat_feature_count": len(stat_names),
+        "temporal_summary_mode": args.temporal_summary_mode,
+        "stat_feature_count": len(stat_input_names),
         "val_metrics": val_metrics,
         "test_rows": int(test_rows),
         "metrics": metrics,
@@ -1223,6 +1459,7 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
             "target_mode": args.target_mode,
             "feature_mode": args.feature_mode,
             "stat_feature_mode": args.stat_feature_mode,
+            "temporal_summary_mode": item.get("temporal_summary_mode", args.temporal_summary_mode),
             "stat_selector": item.get("stat_selector", args.stat_selector),
             "stat_select_k": int(item.get("stat_select_k", args.stat_select_k)),
             "stat_feature_count": int(item.get("stat_feature_count", 0)),
@@ -1248,6 +1485,7 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
                 "fold",
                 "mode",
                 "stat_feature_mode",
+                "temporal_summary_mode",
                 "stat_selector",
                 "stat_select_k",
                 "fusion_mode",
@@ -1268,6 +1506,7 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
         "target_mode",
         "feature_mode",
         "stat_feature_mode",
+        "temporal_summary_mode",
         "stat_selector",
         "stat_select_k",
         "fusion_mode",
@@ -1311,6 +1550,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target_mode", choices=["ahead120", "anomaly", "module_fault"], default="module_fault")
     parser.add_argument("--feature_mode", choices=["model2", "model2_plus"], default="model2_plus")
     parser.add_argument("--stat_feature_mode", choices=["all_engineered", "model2_expert", "statistics", "all"], default="all_engineered")
+    parser.add_argument(
+        "--temporal_summary_mode",
+        choices=list(TEMPORAL_SUMMARY_MODES),
+        default="none",
+        help="Optional temporal raw-channel summary features added to the statistic/expert branch candidate pool.",
+    )
     parser.add_argument("--stat_selector", choices=["none", "extra_trees"], default="none")
     parser.add_argument("--stat_select_k", type=int, default=0)
     parser.add_argument("--stat_selector_estimators", type=int, default=200)

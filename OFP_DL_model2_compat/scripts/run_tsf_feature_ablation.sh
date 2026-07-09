@@ -16,26 +16,43 @@ for variant in ${FEATURE_VARIANTS}; do
   case "${variant}" in
     all_engineered)
       STAT_FEATURE_MODE="all_engineered"
+      TEMPORAL_SUMMARY_MODE="none"
       STAT_SELECTOR="none"
       STAT_SELECT_K="0"
       ;;
     model2_expert)
       STAT_FEATURE_MODE="model2_expert"
+      TEMPORAL_SUMMARY_MODE="none"
       STAT_SELECTOR="none"
       STAT_SELECT_K="0"
       ;;
     statistics)
       STAT_FEATURE_MODE="statistics"
+      TEMPORAL_SUMMARY_MODE="none"
       STAT_SELECTOR="none"
       STAT_SELECT_K="0"
       ;;
     topk64)
       STAT_FEATURE_MODE="all_engineered"
+      TEMPORAL_SUMMARY_MODE="none"
       STAT_SELECTOR="extra_trees"
       STAT_SELECT_K="64"
       ;;
     topk128)
       STAT_FEATURE_MODE="all_engineered"
+      TEMPORAL_SUMMARY_MODE="none"
+      STAT_SELECTOR="extra_trees"
+      STAT_SELECT_K="128"
+      ;;
+    joint_topk64)
+      STAT_FEATURE_MODE="all_engineered"
+      TEMPORAL_SUMMARY_MODE="raw_channel_stats"
+      STAT_SELECTOR="extra_trees"
+      STAT_SELECT_K="64"
+      ;;
+    joint_topk128)
+      STAT_FEATURE_MODE="all_engineered"
+      TEMPORAL_SUMMARY_MODE="raw_channel_stats"
       STAT_SELECTOR="extra_trees"
       STAT_SELECT_K="128"
       ;;
@@ -60,6 +77,7 @@ for variant in ${FEATURE_VARIANTS}; do
     --batch_size 192 \
     --feature_mode model2_plus \
     --stat_feature_mode "${STAT_FEATURE_MODE}" \
+    --temporal_summary_mode "${TEMPORAL_SUMMARY_MODE}" \
     --stat_selector "${STAT_SELECTOR}" \
     --stat_select_k "${STAT_SELECT_K}" \
     --fusion_mode gated_attn \
