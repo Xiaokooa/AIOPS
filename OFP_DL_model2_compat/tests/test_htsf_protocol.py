@@ -15,7 +15,7 @@ from OFP.model2.ExperimentFeatureSchema import (
     feature_group_manifest,
     select_feature_names,
 )
-from OFP_DL_model2_compat.run_model2_compat_deep import evaluate_prediction_frames
+from OFP_DL_model2_compat.run_model2_compat_deep import evaluate_prediction_frames, row_signal_scores
 from OFP_DL_model2_compat.run_htsf_experiments import merge_manifest_entries, selected_specs
 from OFP_DL_model2_compat.run_patchtst_stat_aligned_xgb import (
     FUSION_MODES,
@@ -79,6 +79,52 @@ class FeatureSchemaTest(unittest.TestCase):
             self.assertEqual(tuple(output.shape), (2, 16), msg=mode)
             model.close()
 
+    def test_auxiliary_branch_heads_support_joint_backpropagation(self) -> None:
+        raw = torch.randn(4, 16, 12)
+        mask = torch.ones_like(raw)
+        stat = torch.randn(4, 20)
+        model = TemporalStatAligner(
+            temporal_encoder="fits",
+            seq_len=16,
+            n_raw_features=12,
+            n_stat_features=20,
+            embedding_dim=32,
+            latent_dim=16,
+            stat_hidden=32,
+            attn_heads=4,
+            dropout=0.0,
+            stat_modality_dropout=0.25,
+            fusion_mode="gated_attn",
+        )
+        model.train()
+        fused, temporal, statistical = model.forward_with_aux(raw, mask, stat)
+        self.assertEqual(tuple(fused.shape), (4,))
+        self.assertEqual(tuple(temporal.shape), (4,))
+        self.assertEqual(tuple(statistical.shape), (4,))
+        (fused.mean() + temporal.mean() + statistical.mean()).backward()
+        self.assertIsNotNone(model.temporal_classifier.weight.grad)
+        self.assertIsNotNone(model.stat_classifier.weight.grad)
+        model.close()
+
+    def test_mixed_sampling_signal_contains_raw_temporal_change(self) -> None:
+        features = np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [4.0, 4.0, 0.0],
+                [4.0, 4.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        rules = np.asarray([0, 1, 0, 0], dtype=np.int8)
+        names = ["Temp", "Curr", "FeTempDiff"]
+        temporal = row_signal_scores(features, rules, names, mode="temporal")
+        mixed = row_signal_scores(features, rules, names, mode="mixed", temporal_fraction=0.5)
+        expert = row_signal_scores(features, rules, names, mode="expert")
+        self.assertEqual(int(np.argmax(temporal)), 2)
+        self.assertEqual(int(np.argmax(mixed)), 2)
+        self.assertFalse(np.allclose(mixed, expert))
+
     def test_pre_fusion_latent_selector_recovers_temporal_signal(self) -> None:
         rng = np.random.default_rng(17)
         rows = 600
@@ -136,6 +182,27 @@ class FirstWarningMetricTest(unittest.TestCase):
             self.assertAlmostEqual(metrics["false_alarm_rate"], 0.5)
             self.assertAlmostEqual(metrics["false_alarms_per_1000_normal"], 500.0)
 
+    def test_warning_at_exact_minimum_lead_boundary_is_warnable_and_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            label_dir = Path(tmp)
+            pd.DataFrame(
+                {"timestamp": [0, 40, 100], "anomaly": [0, 0, 1]}
+            ).to_csv(label_dir / "boundary.csv", index=False)
+            predictions = {
+                "boundary.csv": pd.DataFrame(
+                    {"timestamp": [0, 40, 100], "predict": [0, 1, 0]}
+                )
+            }
+            summary, _detail = evaluate_prediction_frames(
+                predictions,
+                label_dir,
+                min_hit_lead_hours=1.0 / 60.0,
+            )
+            metrics = {str(row.Item): float(row.Value) for row in summary.itertuples(index=False)}
+            self.assertEqual(metrics["warnable_positive_cnt"], 1.0)
+            self.assertEqual(metrics["warnable_recall"], 1.0)
+            self.assertEqual(metrics["recall"], 1.0)
+
 
 class CanonicalResultTest(unittest.TestCase):
     def test_complete_htsf_is_scheduled_once(self) -> None:
@@ -145,6 +212,14 @@ class CanonicalResultTest(unittest.TestCase):
         self.assertNotIn("fusion_htsf", experiment_ids)
         self.assertNotIn("sampling_module_hybrid", experiment_ids)
         self.assertNotIn("feature_full", experiment_ids)
+
+    def test_two_stage_training_variant_can_run_without_unrelated_suites(self) -> None:
+        specs = selected_specs(["training"], "training_hard_negative")
+        self.assertEqual([item.experiment_id for item in specs], ["training_hard_negative"])
+        overrides = specs[0].overrides
+        self.assertEqual(overrides["sample_signal_mode"], "mixed")
+        self.assertGreater(overrides["adaptive_negative_weight"], 0.0)
+        self.assertTrue(overrides["xgb_use_sample_weight"])
 
     def test_manifest_merge_removes_deprecated_duplicate_runs(self) -> None:
         merged = merge_manifest_entries(
