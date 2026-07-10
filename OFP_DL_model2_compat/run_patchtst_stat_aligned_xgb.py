@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
+import os
 import pickle
 import sys
 import time
@@ -24,6 +26,8 @@ from OFP_DL_model2_compat.run_model2_compat_deep import (
     BUILDERS,
     CompatBatchedDataset,
     CompatCfg,
+    FEATURE_CACHE_VERSION,
+    FeatureNormStats,
     Model2FeatureCache,
     cap_files_stratified,
     compat_alarm_logit,
@@ -41,6 +45,7 @@ from OFP_DL_model2_compat.run_model2_compat_deep import (
 )
 from OFP_DL_model2_compat.run_model2_compat_tabular_fusion import (
     LastLinearInputHook,
+    build_ml_model,
     evaluate_prediction_output,
     log_stage_done,
     log_stage_start,
@@ -55,6 +60,10 @@ from OFP_DL_model2_compat.lead_time_sweep import (
 )
 from OFP_DL_official.common.index_split import files_for_index_fold, read_index
 from OFP_DL_official.common.trainer import format_metric_summary, resolve_runtime_device
+from OFP.model2.ExperimentFeatureSchema import (
+    feature_group_manifest,
+    select_feature_names,
+)
 
 
 RUN_NAME = "patchtst_stat_aligned_xgb"
@@ -79,10 +88,25 @@ RAW_SEQUENCE_FEATURES = [
 ]
 TEMPORAL_SUMMARY_MODES = ("none", "raw_channel_stats")
 TEMPORAL_SUMMARY_OPS = ("last", "mean", "std", "min", "max", "delta", "range")
+FUSION_MODES = ("temporal_only", "stat_only", "latent_concat", "attn_mean", "gated_attn")
+DECISION_LAYERS = ("xgb", "rf", "lgbm", "catboost")
 
 
-def tsf_run_name(temporal_encoder: str) -> str:
-    return f"{str(temporal_encoder).lower()}_stat_aligned_xgb"
+def tsf_run_name(temporal_encoder: str, decision_layer: str = "xgb") -> str:
+    return f"{str(temporal_encoder).lower()}_stat_aligned_{str(decision_layer).lower()}"
+
+
+def resolve_fusion_mode(fusion_mode: str, tsf_ablation: str = "full") -> str:
+    legacy = {
+        "full": str(fusion_mode),
+        "no_stat_branch": "temporal_only",
+        "no_temporal_branch": "stat_only",
+        "no_cross_attention": "latent_concat",
+    }
+    mode = legacy.get(str(tsf_ablation), str(fusion_mode))
+    if mode not in FUSION_MODES:
+        raise ValueError(f"Unknown fusion mode {mode!r}; use one of {FUSION_MODES}")
+    return mode
 
 
 def configure_runtime(cfg: CompatCfg, seed: int, fold: int) -> None:
@@ -98,7 +122,47 @@ def configure_runtime(cfg: CompatCfg, seed: int, fold: int) -> None:
             pass
 
 
-def feature_indices(feature_names: list[str], stat_feature_mode: str) -> tuple[list[int], list[str], list[int], list[str]]:
+def load_or_compute_feature_norm_stats(
+    data_dir: Path,
+    train_files: list[str],
+    cfg: CompatCfg,
+    label_by_file: dict[str, int],
+) -> FeatureNormStats:
+    if not str(cfg.module_cache_dir).strip():
+        return compute_feature_norm_stats(data_dir, train_files, cfg, label_by_file)
+    fingerprint_payload = {
+        "cache_version": FEATURE_CACHE_VERSION,
+        "feature_mode": cfg.feature_mode,
+        "target_mode": cfg.target_mode,
+        "rule_mode": cfg.rule_mode,
+        "train_files": sorted(train_files),
+    }
+    fingerprint = hashlib.sha1(
+        json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:20]
+    cache_path = Path(cfg.module_cache_dir) / "norm_stats" / f"{fingerprint}.json"
+    if cache_path.exists():
+        try:
+            return FeatureNormStats(**json.loads(cache_path.read_text(encoding="utf-8")))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            cache_path.unlink(missing_ok=True)
+    stats = compute_feature_norm_stats(data_dir, train_files, cfg, label_by_file)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+    try:
+        temp_path.write_text(json.dumps(asdict(stats), indent=2), encoding="utf-8")
+        os.replace(temp_path, cache_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return stats
+
+
+def feature_indices(
+    feature_names: list[str],
+    stat_feature_mode: str,
+    stat_feature_groups: str = "",
+    exclude_stat_feature_groups: str = "",
+) -> tuple[list[int], list[str], list[int], list[str]]:
     raw_names = [name for name in RAW_SEQUENCE_FEATURES if name in feature_names]
     raw_indices = [feature_names.index(name) for name in raw_names]
     if not raw_indices:
@@ -106,7 +170,16 @@ def feature_indices(feature_names: list[str], stat_feature_mode: str) -> tuple[l
 
     raw_set = set(raw_names) | {"Ts"}
     mode = str(stat_feature_mode).lower()
-    if mode == "all_engineered":
+    if str(stat_feature_groups).strip():
+        stat_names = select_feature_names(
+            feature_names,
+            stat_feature_groups,
+            exclude_stat_feature_groups,
+        )
+        stat_names = [name for name in stat_names if name not in raw_set]
+    elif mode in {"ofp_expert_stat", "expert_statistical"}:
+        stat_names = select_feature_names(feature_names, "expert_statistical")
+    elif mode == "all_engineered":
         stat_names = [name for name in feature_names if name not in raw_set]
     elif mode == "model2_expert":
         keep = {"FeCo", "FeTxP0", "FeRxP0", "TsDelta"}
@@ -130,9 +203,14 @@ def feature_indices(feature_names: list[str], stat_feature_mode: str) -> tuple[l
     elif mode == "all":
         stat_names = list(feature_names)
     else:
-        raise ValueError("Unknown stat_feature_mode; use all_engineered, model2_expert, statistics, or all")
+        raise ValueError(
+            "Unknown stat_feature_mode; use ofp_expert_stat, all_engineered, model2_expert, statistics, or all"
+        )
     if not stat_names:
-        stat_names = [name for name in feature_names if name not in raw_set]
+        raise ValueError(
+            "The selected expert/statistical feature groups are empty. "
+            "Check --feature_mode, --stat_feature_groups, and --exclude_stat_feature_groups."
+        )
     stat_indices = [feature_names.index(name) for name in stat_names]
     return raw_indices, raw_names, stat_indices, stat_names
 
@@ -276,6 +354,175 @@ def _cap_explain_rows(x: np.ndarray, y: np.ndarray, max_rows: int, seed: int) ->
     return x[keep], y[keep]
 
 
+def resolve_branch_selection_budgets(
+    total_select_k: int,
+    temporal_select_k: int,
+    stat_select_k: int,
+    n_temporal_features: int,
+    n_stat_features: int,
+) -> tuple[int, int]:
+    """Resolve an explicit branch-wise allocation for a total input-feature budget."""
+    total = int(total_select_k)
+    temporal = int(temporal_select_k)
+    stat = int(stat_select_k)
+    if min(total, temporal, stat) < 0:
+        raise ValueError("Feature-selection budgets must be non-negative")
+    if total > 0:
+        if temporal <= 0:
+            raise ValueError(
+                "--total_select_k requires an explicit positive --temporal_select_k. "
+                "The two branch-wise ExtraTrees importance scales are not directly comparable."
+            )
+        stat_from_total = total - temporal
+        if stat_from_total <= 0:
+            raise ValueError("--total_select_k must leave at least one feature for the expert-statistical branch")
+        if stat > 0 and stat != stat_from_total:
+            raise ValueError(
+                f"Inconsistent Top-K allocation: total={total}, temporal={temporal}, "
+                f"stat={stat}; expected stat={stat_from_total}"
+            )
+        stat = stat_from_total
+    if temporal > int(n_temporal_features):
+        raise ValueError(
+            f"Requested {temporal} temporal channels, but only {n_temporal_features} are available"
+        )
+    if stat > int(n_stat_features):
+        raise ValueError(f"Requested {stat} expert-statistical features, but only {n_stat_features} are available")
+    return temporal, stat
+
+
+def maybe_select_temporal_features(
+    cache: Model2FeatureCache,
+    base_dataset: CompatBatchedDataset,
+    cfg: CompatCfg,
+    raw_indices: list[int],
+    raw_names: list[str],
+    args: argparse.Namespace,
+    fold: int,
+    run_dir: Path,
+    select_k: int,
+    strict: bool = False,
+) -> tuple[list[int], list[str], dict[str, Any]]:
+    """Rank raw DDM channels on training windows and optionally prune the temporal input."""
+    selector_name = str(args.temporal_selector).lower()
+    k = int(select_k)
+    all_indices = list(raw_indices)
+    all_names = list(raw_names)
+    meta: dict[str, Any] = {
+        "temporal_selector": selector_name,
+        "requested_temporal_select_k": k,
+        "original_temporal_feature_count": len(all_names),
+    }
+    if selector_name == "none":
+        if strict and 0 < k < len(all_names):
+            raise ValueError("A total Top-K budget requires --temporal_selector extra_trees")
+        meta["selected_temporal_feature_count"] = len(all_names)
+        meta["selected_features"] = [
+            {"feature": name, "rank": rank, "importance": None}
+            for rank, name in enumerate(all_names, 1)
+        ]
+        return all_indices, all_names, meta
+
+    x_parts: list[np.ndarray] = []
+    y_parts: list[np.ndarray] = []
+    for name, selected in zip(base_dataset.file_names, base_dataset.selected_positions):
+        if len(selected) <= 0:
+            continue
+        _ts, features, _valid_mask, labels, _anomaly_labels, _rule_pred, _extra = cache.get(name)
+        raw = features[:, np.asarray(raw_indices, dtype=np.int64)].astype(np.float32)
+        x_parts.append(
+            compute_temporal_window_summaries(
+                raw,
+                selected,
+                int(cfg.seq_len),
+                "raw_channel_stats",
+            )
+        )
+        y_parts.append(labels[selected].astype(np.int8))
+    if not x_parts:
+        if strict:
+            raise ValueError("Temporal feature selection has no training windows")
+        meta.update({"selected_temporal_feature_count": len(all_names), "reason": "empty_training_selection"})
+        return all_indices, all_names, meta
+    x = np.concatenate(x_parts, axis=0)
+    y = np.concatenate(y_parts, axis=0)
+    x, y = _cap_explain_rows(x, y, int(args.temporal_selector_max_rows), int(args.seed) + int(fold))
+    if len(np.unique(y)) < 2:
+        if strict:
+            raise ValueError("Temporal feature selection requires both positive and negative training windows")
+        meta.update({"selected_temporal_feature_count": len(all_names), "reason": "single_class_training_selection"})
+        return all_indices, all_names, meta
+
+    selector = ExtraTreesClassifier(
+        n_estimators=int(args.temporal_selector_estimators),
+        random_state=int(args.seed) + int(fold),
+        n_jobs=int(args.n_jobs),
+        class_weight="balanced",
+    )
+    started = time.time()
+    selector.fit(x, y)
+    descriptor_scores = np.asarray(selector.feature_importances_, dtype=float)
+    operation_scores = descriptor_scores.reshape(len(all_names), len(TEMPORAL_SUMMARY_OPS))
+    channel_scores = operation_scores.sum(axis=1)
+    score_total = float(channel_scores.sum())
+    if score_total > 0.0:
+        channel_scores = channel_scores / score_total
+    ranking = np.argsort(channel_scores)[::-1]
+    keep_count = len(all_names) if k <= 0 else min(k, len(all_names))
+    selected_local = [int(value) for value in ranking[:keep_count]]
+    selected_indices = [all_indices[index] for index in selected_local]
+    selected_names = [all_names[index] for index in selected_local]
+
+    explain_dir = run_dir / "explainability"
+    descriptor_names = temporal_summary_feature_names(all_names, "raw_channel_stats")
+    descriptor_frame = _save_score_table(
+        explain_dir / "temporal_summary_descriptor_importance.csv",
+        descriptor_names,
+        descriptor_scores,
+        "importance",
+    )
+    _save_topk_heatmap(
+        explain_dir / "temporal_summary_descriptor_importance_topk_heatmap.png",
+        descriptor_frame,
+        "importance",
+    )
+    selected_set = set(selected_names)
+    channel_frame = pd.DataFrame(
+        {
+            "feature": all_names,
+            "importance": channel_scores,
+            "selected": [name in selected_set for name in all_names],
+        }
+    ).sort_values("importance", ascending=False, ignore_index=True)
+    channel_frame.insert(0, "rank", np.arange(1, len(channel_frame) + 1))
+    explain_dir.mkdir(parents=True, exist_ok=True)
+    channel_frame.to_csv(explain_dir / "temporal_raw_channel_importance.csv", index=False)
+    _save_topk_heatmap(
+        explain_dir / "temporal_raw_channel_importance_topk_heatmap.png",
+        channel_frame,
+        "importance",
+        top_k=len(all_names),
+    )
+    _save_heatmap(
+        explain_dir / "temporal_channel_operation_importance_heatmap.png",
+        operation_scores,
+        list(TEMPORAL_SUMMARY_OPS),
+        all_names,
+    )
+    selected_frame = channel_frame[channel_frame["selected"]].copy()
+    selected_frame.to_csv(explain_dir / "selected_temporal_features.csv", index=False)
+    meta.update(
+        {
+            "selected_temporal_feature_count": len(selected_names),
+            "temporal_selector_rows": int(len(y)),
+            "temporal_selector_positive_rows": int((y > 0).sum()),
+            "temporal_selector_seconds": float(time.time() - started),
+            "selected_features": selected_frame[["feature", "rank", "importance"]].to_dict("records"),
+        }
+    )
+    return selected_indices, selected_names, meta
+
+
 def maybe_select_stat_features(
     cache: Model2FeatureCache,
     base_dataset: CompatBatchedDataset,
@@ -287,9 +534,11 @@ def maybe_select_stat_features(
     args: argparse.Namespace,
     fold: int,
     run_dir: Path,
+    select_k: int | None = None,
+    strict: bool = False,
 ) -> tuple[list[int], list[str], dict[str, Any], list[str]]:
     selector_name = str(args.stat_selector).lower()
-    k = int(args.stat_select_k)
+    k = int(args.stat_select_k if select_k is None else select_k)
     candidate_names = stat_candidate_names(stat_names, raw_names, str(args.temporal_summary_mode))
     temporal_summary_count = len(candidate_names) - len(stat_names)
     meta: dict[str, Any] = {
@@ -301,8 +550,14 @@ def maybe_select_stat_features(
         "original_stat_feature_count": len(candidate_names),
     }
     all_local_indices = list(range(len(candidate_names)))
-    if selector_name == "none" or k <= 0 or k >= len(candidate_names):
+    if selector_name == "none":
+        if strict and 0 < k < len(candidate_names):
+            raise ValueError("A total Top-K budget requires --stat_selector extra_trees")
         meta["selected_stat_feature_count"] = len(candidate_names)
+        meta["selected_features"] = [
+            {"feature": name, "rank": rank, "importance": None}
+            for rank, name in enumerate(candidate_names, 1)
+        ]
         return all_local_indices, candidate_names, meta, candidate_names
     x_parts: list[np.ndarray] = []
     y_parts: list[np.ndarray] = []
@@ -322,6 +577,8 @@ def maybe_select_stat_features(
         )
         y_parts.append(labels[selected].astype(np.int8))
     if not x_parts:
+        if strict:
+            raise ValueError("Expert-statistical feature selection has no training windows")
         meta["selected_stat_feature_count"] = len(candidate_names)
         meta["reason"] = "empty_training_selection"
         return all_local_indices, candidate_names, meta, candidate_names
@@ -329,6 +586,8 @@ def maybe_select_stat_features(
     y = np.concatenate(y_parts, axis=0)
     x, y = _cap_explain_rows(x, y, int(args.stat_selector_max_rows), int(args.seed) + int(fold))
     if len(np.unique(y)) < 2:
+        if strict:
+            raise ValueError("Expert-statistical feature selection requires both positive and negative training windows")
         meta["selected_stat_feature_count"] = len(candidate_names)
         meta["reason"] = "single_class_training_selection"
         return all_local_indices, candidate_names, meta, candidate_names
@@ -342,7 +601,8 @@ def maybe_select_stat_features(
     selector.fit(x, y)
     scores = np.asarray(selector.feature_importances_, dtype=float)
     ranking = np.argsort(scores)[::-1]
-    local = ranking[: min(k, len(ranking))]
+    keep_count = len(ranking) if k <= 0 else min(k, len(ranking))
+    local = ranking[:keep_count]
     selected_indices = [int(i) for i in local]
     selected_names = [candidate_names[int(i)] for i in local]
     importance = _save_score_table(
@@ -351,6 +611,10 @@ def maybe_select_stat_features(
         scores,
         "importance",
     )
+    selected_set = set(selected_names)
+    importance.insert(0, "rank", np.arange(1, len(importance) + 1))
+    importance["selected"] = importance["feature"].isin(selected_set)
+    importance.to_csv(run_dir / "explainability" / "stat_feature_importance.csv", index=False)
     _save_topk_heatmap(run_dir / "explainability" / "stat_feature_importance_topk_heatmap.png", importance, "importance")
     meta.update(
         {
@@ -358,6 +622,9 @@ def maybe_select_stat_features(
             "stat_selector_rows": int(len(y)),
             "stat_selector_positive_rows": int((y > 0).sum()),
             "stat_selector_seconds": float(time.time() - started),
+            "selected_features": importance.loc[
+                importance["selected"], ["feature", "rank", "importance"]
+            ].to_dict("records"),
         }
     )
     (run_dir / "explainability" / "selected_stat_features.csv").write_text(
@@ -458,8 +725,9 @@ class TemporalStatAligner(nn.Module):
         self.temporal_encoder = str(temporal_encoder).lower()
         if self.temporal_encoder not in TEMPORAL_ENCODERS:
             raise ValueError(f"Unknown temporal_encoder={temporal_encoder!r}; use one of {TEMPORAL_ENCODERS}")
-        self.fusion_mode = str(fusion_mode)
+        self.requested_fusion_mode = str(fusion_mode)
         self.tsf_ablation = str(tsf_ablation)
+        self.fusion_mode = resolve_fusion_mode(self.requested_fusion_mode, self.tsf_ablation)
         self.temporal_model, self.temporal_encoder_cfg, _ = BUILDERS[self.temporal_encoder](
             int(seq_len),
             int(n_raw_features),
@@ -491,6 +759,12 @@ class TemporalStatAligner(nn.Module):
             nn.Linear(int(latent_dim) * 2, int(latent_dim)),
             nn.Sigmoid(),
         )
+        self.single_view_fusion = nn.Sequential(
+            nn.LayerNorm(int(latent_dim)),
+            nn.Linear(int(latent_dim), int(latent_dim)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+        )
         self.fusion = nn.Sequential(
             nn.LayerNorm(int(latent_dim) * 2),
             nn.Linear(int(latent_dim) * 2, int(latent_dim)),
@@ -521,13 +795,9 @@ class TemporalStatAligner(nn.Module):
         seq_emb = self.seq_embedding(emb)
         seq_latent = self.seq_projection(seq_emb)
         stat_latent = self.stat_mlp(stat_x)
-        if self.tsf_ablation == "no_stat_branch":
-            stat_latent = torch.zeros_like(stat_latent)
-        elif self.tsf_ablation == "no_temporal_branch":
-            seq_latent = torch.zeros_like(seq_latent)
         tokens = torch.stack([seq_latent, stat_latent], dim=1)
         aligned = self.feature_alignment(tokens)
-        if self.tsf_ablation == "no_cross_attention":
+        if self.fusion_mode in {"temporal_only", "stat_only", "latent_concat"}:
             attended = aligned
             attn_weights = torch.eye(2, dtype=aligned.dtype, device=aligned.device).reshape(1, 1, 2, 2).repeat(
                 aligned.shape[0],
@@ -543,18 +813,28 @@ class TemporalStatAligner(nn.Module):
                 need_weights=True,
                 average_attn_weights=False,
             )
-        if self.fusion_mode == "attn_mean":
+        if self.fusion_mode == "temporal_only":
+            fused = self.single_view_fusion(seq_latent)
+            gate = torch.ones_like(seq_latent)
+        elif self.fusion_mode == "stat_only":
+            fused = self.single_view_fusion(stat_latent)
+            gate = torch.zeros_like(seq_latent)
+        elif self.fusion_mode == "latent_concat":
+            fused = self.fusion(torch.cat([seq_latent, stat_latent], dim=1))
+            gate = torch.full_like(seq_latent, 0.5)
+        elif self.fusion_mode == "attn_mean":
             pooled = torch.cat([tokens.mean(dim=1), attended.mean(dim=1)], dim=1)
             gate = torch.full_like(seq_latent, 0.5)
+            fused = self.fusion(pooled)
         elif self.fusion_mode == "gated_attn":
             seq_context = 0.5 * (seq_latent + attended[:, 0, :])
             stat_context = 0.5 * (stat_latent + attended[:, 1, :])
             gate = self.modality_gate(torch.cat([seq_latent, stat_latent], dim=1))
             gated = gate * seq_context + (1.0 - gate) * stat_context
             pooled = torch.cat([gated, attended.mean(dim=1)], dim=1)
+            fused = self.fusion(pooled)
         else:
             raise ValueError(f"Unknown fusion_mode={self.fusion_mode!r}")
-        fused = self.fusion(pooled)
         if return_explain:
             return fused, {
                 "attention": attn_weights.detach(),
@@ -584,6 +864,42 @@ def initialize_lazy_layers(model: TemporalStatAligner, dataset: SelectedWindowSt
         )
 
 
+def write_branch_selection_manifest(
+    run_dir: Path,
+    temporal_meta: dict[str, Any],
+    stat_meta: dict[str, Any],
+    requested_total_k: int,
+) -> None:
+    rows: list[dict[str, Any]] = []
+    for branch, meta in (("temporal_raw", temporal_meta), ("expert_statistical", stat_meta)):
+        for item in meta.get("selected_features", []):
+            rows.append(
+                {
+                    "branch": branch,
+                    "feature": item.get("feature", ""),
+                    "within_branch_rank": item.get("rank"),
+                    "within_branch_importance": item.get("importance"),
+                }
+            )
+    explain_dir = run_dir / "explainability"
+    explain_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(explain_dir / "selected_feature_manifest.csv", index=False)
+    summary = {
+        "requested_total_select_k": int(requested_total_k),
+        "selected_temporal_feature_count": int(temporal_meta.get("selected_temporal_feature_count", 0)),
+        "selected_stat_feature_count": int(stat_meta.get("selected_stat_feature_count", 0)),
+        "selected_input_feature_count": int(
+            temporal_meta.get("selected_temporal_feature_count", 0)
+            + stat_meta.get("selected_stat_feature_count", 0)
+        ),
+        "importance_note": "Importance values are normalized within each branch and must not be compared across branches.",
+    }
+    (explain_dir / "branch_selection_summary.json").write_text(
+        json.dumps(summary, indent=2),
+        encoding="utf-8",
+    )
+
+
 def train_fusion_encoder(
     train_files: list[str],
     cache: Model2FeatureCache,
@@ -595,7 +911,16 @@ def train_fusion_encoder(
     args: argparse.Namespace,
     fold: int,
     run_dir: Path,
-) -> tuple[TemporalStatAligner, CompatBatchedDataset, dict[str, Any], list[int], list[str], list[str]]:
+) -> tuple[
+    TemporalStatAligner,
+    CompatBatchedDataset,
+    dict[str, Any],
+    list[int],
+    list[str],
+    list[int],
+    list[str],
+    list[str],
+]:
     started = log_stage_start(
         "build_fusion_dataset",
         RUN_NAME,
@@ -605,23 +930,67 @@ def train_fusion_encoder(
         sampling_mode=cfg.sampling_mode,
     )
     base_dataset = CompatBatchedDataset(train_files, cache, cfg)
-    stat_input_indices, stat_input_names, stat_selector_meta, stat_candidate_feature_names = maybe_select_stat_features(
+    if int(base_dataset.pos_rows) <= 0:
+        raise ValueError(
+            "The selected training subset contains no positive pre-anomaly windows. "
+            "Increase --max_train_files or verify --target_mode and the trace split before using this run as evidence."
+        )
+    if int(args.total_select_k) > 0 and str(args.temporal_summary_mode).lower() != "none":
+        raise ValueError(
+            "Branch-wise total Top-K requires --temporal_summary_mode none so raw temporal summaries "
+            "do not leak into the expert-statistical branch."
+        )
+    original_stat_candidates = stat_candidate_names(stat_names, raw_names, str(args.temporal_summary_mode))
+    temporal_select_k, stat_select_k = resolve_branch_selection_budgets(
+        int(args.total_select_k),
+        int(args.temporal_select_k),
+        int(args.stat_select_k),
+        len(raw_names),
+        len(original_stat_candidates),
+    )
+    strict_budget = int(args.total_select_k) > 0
+    selected_raw_indices, selected_raw_names, temporal_selector_meta = maybe_select_temporal_features(
         cache,
         base_dataset,
         cfg,
         raw_indices,
         raw_names,
+        args,
+        fold,
+        run_dir,
+        temporal_select_k,
+        strict=strict_budget,
+    )
+    stat_input_indices, stat_input_names, stat_selector_meta, stat_candidate_feature_names = maybe_select_stat_features(
+        cache,
+        base_dataset,
+        cfg,
+        selected_raw_indices,
+        selected_raw_names,
         stat_indices,
         stat_names,
         args,
         fold,
         run_dir,
+        select_k=stat_select_k,
+        strict=strict_budget,
+    )
+    actual_total = len(selected_raw_names) + len(stat_input_names)
+    if strict_budget and actual_total != int(args.total_select_k):
+        raise RuntimeError(
+            f"Branch selection produced {actual_total} inputs, expected total Top-K={int(args.total_select_k)}"
+        )
+    write_branch_selection_manifest(
+        run_dir,
+        temporal_selector_meta,
+        stat_selector_meta,
+        int(args.total_select_k),
     )
     fusion_dataset = SelectedWindowStatDataset(
         base_dataset,
         cache,
         cfg,
-        raw_indices,
+        selected_raw_indices,
         stat_indices,
         stat_input_indices,
         str(args.temporal_summary_mode),
@@ -638,7 +1007,7 @@ def train_fusion_encoder(
     model = TemporalStatAligner(
         temporal_encoder=args.temporal_encoder,
         seq_len=cfg.seq_len,
-        n_raw_features=len(raw_indices),
+        n_raw_features=len(selected_raw_indices),
         n_stat_features=len(stat_input_indices),
         embedding_dim=args.seq_embedding_dim,
         latent_dim=args.latent_dim,
@@ -723,7 +1092,7 @@ def train_fusion_encoder(
                 cache,
                 base_dataset,
                 cfg,
-                raw_indices,
+                selected_raw_indices,
                 stat_indices,
                 stat_input_indices,
                 str(args.temporal_summary_mode),
@@ -746,9 +1115,25 @@ def train_fusion_encoder(
         "pos_weight": float(pos_weight),
         "history": history,
         "adaptive_negative_weight_meta": adaptive_meta,
+        "temporal_feature_selection": temporal_selector_meta,
         "stat_feature_selection": stat_selector_meta,
+        "branch_selection": {
+            "requested_total_select_k": int(args.total_select_k),
+            "effective_temporal_select_k": int(temporal_select_k),
+            "effective_stat_select_k": int(stat_select_k),
+            "selected_input_feature_count": int(actual_total),
+        },
     }
-    return model, base_dataset, meta, stat_input_indices, stat_input_names, stat_candidate_feature_names
+    return (
+        model,
+        base_dataset,
+        meta,
+        selected_raw_indices,
+        selected_raw_names,
+        stat_input_indices,
+        stat_input_names,
+        stat_candidate_feature_names,
+    )
 
 
 @torch.no_grad()
@@ -762,6 +1147,7 @@ def encode_file_positions(
     stat_input_indices: list[int],
     temporal_summary_mode: str,
     positions: np.ndarray | None = None,
+    return_branch_latents: bool = False,
 ) -> dict[str, np.ndarray]:
     model.eval()
     timestamps, features, _valid_mask, labels, _anomaly_labels, rule_pred, extra = cache.get(file_name)
@@ -775,6 +1161,8 @@ def encode_file_positions(
         return {
             "timestamps": np.zeros(0, dtype=np.int64),
             "fused": np.zeros((0, 0), dtype=np.float32),
+            "temporal_latent": np.zeros((0, 0), dtype=np.float32),
+            "statistical_latent": np.zeros((0, 0), dtype=np.float32),
             "logits": np.zeros(0, dtype=np.float32),
             "labels": np.zeros(0, dtype=np.int8),
             "weights": np.ones(0, dtype=np.float32),
@@ -799,6 +1187,8 @@ def encode_file_positions(
     x_windows = x_pad.unfold(0, seq_len, 1).permute(0, 2, 1)
     m_windows = m_pad.unfold(0, seq_len, 1).permute(0, 2, 1)
     fused_parts: list[np.ndarray] = []
+    temporal_parts: list[np.ndarray] = []
+    statistical_parts: list[np.ndarray] = []
     logit_parts: list[np.ndarray] = []
     for start in range(0, len(positions), int(cfg.batch_size)):
         batch_pos = positions[start : start + int(cfg.batch_size)]
@@ -807,13 +1197,30 @@ def encode_file_positions(
         raw_m = m_windows.index_select(0, idx).contiguous().to(cfg.device)
         stat_x = torch.from_numpy(stat[start : start + len(batch_pos)].astype(np.float32)).to(cfg.device)
         with cuda_autocast(bool(cfg.amp) and str(cfg.device).startswith("cuda")):
-            fused = model.encode(raw_x, raw_m, stat_x)
+            if return_branch_latents:
+                fused, explain = model.encode(raw_x, raw_m, stat_x, return_explain=True)
+            else:
+                fused = model.encode(raw_x, raw_m, stat_x)
+                explain = None
             logits = model.classifier(fused).squeeze(-1)
         fused_parts.append(fused.float().detach().cpu().numpy().astype(np.float32))
+        if explain is not None:
+            temporal_parts.append(explain["seq_latent"].float().cpu().numpy().astype(np.float32))
+            statistical_parts.append(explain["stat_latent"].float().cpu().numpy().astype(np.float32))
         logit_parts.append(logits.float().detach().cpu().numpy().astype(np.float32))
     return {
         "timestamps": timestamps[positions].astype(np.int64),
         "fused": np.concatenate(fused_parts, axis=0).astype(np.float32),
+        "temporal_latent": (
+            np.concatenate(temporal_parts, axis=0).astype(np.float32)
+            if temporal_parts
+            else np.zeros((len(positions), 0), dtype=np.float32)
+        ),
+        "statistical_latent": (
+            np.concatenate(statistical_parts, axis=0).astype(np.float32)
+            if statistical_parts
+            else np.zeros((len(positions), 0), dtype=np.float32)
+        ),
         "logits": np.concatenate(logit_parts, axis=0).astype(np.float32),
         "labels": labels[positions].astype(np.int8),
         "weights": np.ones(len(positions), dtype=np.float32),
@@ -909,17 +1316,236 @@ def collect_fused_training_table(
     return x, y, w, [f"aligned_latent_{idx:03d}" for idx in range(x.shape[1])]
 
 
-def save_xgb_latent_importance(estimator: Any, latent_names: list[str], run_dir: Path) -> None:
+def save_decision_latent_importance(estimator: Any, latent_names: list[str], run_dir: Path) -> None:
     scores = getattr(estimator, "feature_importances_", None)
     if scores is None:
         return
     frame = _save_score_table(
-        run_dir / "explainability" / "xgb_latent_importance.csv",
+        run_dir / "explainability" / "decision_latent_importance.csv",
         latent_names,
         np.asarray(scores, dtype=float),
         "importance",
     )
-    _save_topk_heatmap(run_dir / "explainability" / "xgb_latent_importance_topk_heatmap.png", frame, "importance")
+    _save_topk_heatmap(run_dir / "explainability" / "decision_latent_importance_topk_heatmap.png", frame, "importance")
+
+
+def pre_fusion_latent_names(latent_dim: int) -> list[str]:
+    temporal = [f"temporal_latent_{idx:03d}" for idx in range(int(latent_dim))]
+    statistical = [f"expert_statistical_latent_{idx:03d}" for idx in range(int(latent_dim))]
+    return temporal + statistical
+
+
+def collect_pre_fusion_training_table(
+    model: TemporalStatAligner,
+    cache: Model2FeatureCache,
+    dataset: CompatBatchedDataset,
+    cfg: CompatCfg,
+    raw_indices: list[int],
+    stat_indices: list[int],
+    stat_input_indices: list[int],
+    temporal_summary_mode: str,
+    fold: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    x_parts: list[np.ndarray] = []
+    y_parts: list[np.ndarray] = []
+    w_parts: list[np.ndarray] = []
+    started = log_stage_start("collect_pre_fusion_latents", RUN_NAME, fold, files=len(dataset.file_names))
+    weight_by_name = {name: weights for name, weights in zip(dataset.file_names, dataset.selected_weights)}
+    for idx, (file_name, positions) in enumerate(zip(dataset.file_names, dataset.selected_positions), 1):
+        if len(positions) == 0:
+            continue
+        block = encode_file_positions(
+            model,
+            cache,
+            file_name,
+            cfg,
+            raw_indices,
+            stat_indices,
+            stat_input_indices,
+            temporal_summary_mode,
+            positions,
+            return_branch_latents=True,
+        )
+        temporal = block["temporal_latent"]
+        statistical = block["statistical_latent"]
+        if temporal.shape[1] == 0 or statistical.shape[1] == 0:
+            raise RuntimeError("The encoder did not expose both pre-fusion latent branches")
+        x_parts.append(np.concatenate([temporal, statistical], axis=1).astype(np.float32))
+        y_parts.append(block["labels"])
+        w_parts.append(weight_by_name.get(file_name, np.ones(len(positions), dtype=np.float32)).astype(np.float32))
+        if idx % 200 == 0:
+            elapsed = time.time() - started
+            print(
+                f"[stage-progress] model={RUN_NAME} fold={fold} stage=collect_pre_fusion_latents "
+                f"{progress_bar(idx, len(dataset.file_names), width=18)} files={idx}/{len(dataset.file_names)} "
+                f"rows={sum(len(part) for part in y_parts)} rate={format_rate(idx, elapsed)} "
+                f"elapsed={format_duration(elapsed)}",
+                flush=True,
+            )
+    if not x_parts:
+        raise ValueError("No pre-fusion latent rows were collected")
+    x = np.concatenate(x_parts, axis=0).astype(np.float32)
+    y = np.concatenate(y_parts, axis=0).astype(np.int8)
+    weights = np.concatenate(w_parts, axis=0).astype(np.float32)
+    if x.shape[1] % 2 != 0:
+        raise RuntimeError(f"Expected equal temporal/statistical latent dimensions, got {x.shape[1]}")
+    names = pre_fusion_latent_names(x.shape[1] // 2)
+    log_stage_done(
+        "collect_pre_fusion_latents",
+        started,
+        RUN_NAME,
+        fold,
+        rows=len(y),
+        features=x.shape[1],
+        positives=int(np.sum(y > 0)),
+        negatives=int(np.sum(y <= 0)),
+    )
+    return x, y, weights, names
+
+
+def _save_latent_branch_composition(path: Path, temporal_count: int, statistical_count: int) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[plot-skip] path={path} reason={exc}", flush=True)
+        return
+    labels = ["Temporal latent", "Expert-statistical latent"]
+    values = [int(temporal_count), int(statistical_count)]
+    fig, ax = plt.subplots(figsize=(4.8, 3.0), dpi=180)
+    bars = ax.bar(labels, values, color=["#2F6B9A", "#D58A3A"], width=0.62)
+    ax.set_ylabel("Selected dimensions")
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(axis="x", labelrotation=12)
+    for bar, value in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, value, str(value), ha="center", va="bottom", fontsize=8)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def select_pre_fusion_latent_features(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    feature_names: list[str],
+    top_k: int,
+    args: argparse.Namespace,
+    fold: int,
+    run_dir: Path,
+) -> tuple[list[int], dict[str, Any]]:
+    if x_train.shape[1] != len(feature_names):
+        raise ValueError("Pre-fusion latent names do not match the latent matrix")
+    k = int(top_k)
+    if k <= 0 or k > x_train.shape[1]:
+        raise ValueError(f"--latent_probe_topk must be in [1, {x_train.shape[1]}], got {k}")
+    selector_x, selector_y = _cap_explain_rows(
+        x_train,
+        y_train,
+        int(args.latent_probe_max_rows),
+        int(args.seed) + int(fold) + 2003,
+    )
+    if len(np.unique(selector_y)) < 2:
+        raise ValueError("Pre-fusion latent selection requires both positive and negative training windows")
+    selector = ExtraTreesClassifier(
+        n_estimators=int(args.latent_probe_estimators),
+        random_state=int(args.seed) + int(fold) + 2003,
+        n_jobs=int(args.n_jobs),
+        class_weight="balanced",
+    )
+    started = time.time()
+    selector.fit(selector_x, selector_y)
+    importance = np.asarray(selector.feature_importances_, dtype=float)
+    ranking = np.argsort(importance)[::-1]
+    selected_indices = [int(value) for value in ranking[:k]]
+    selected_set = set(selected_indices)
+    latent_dim = x_train.shape[1] // 2
+    frame = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "branch": ["temporal" if idx < latent_dim else "expert_statistical" for idx in range(len(feature_names))],
+            "latent_dimension": [idx if idx < latent_dim else idx - latent_dim for idx in range(len(feature_names))],
+            "importance": importance,
+            "selected": [idx in selected_set for idx in range(len(feature_names))],
+        }
+    ).sort_values("importance", ascending=False, ignore_index=True)
+    frame.insert(0, "rank", np.arange(1, len(frame) + 1))
+    explain_dir = run_dir / "explainability" / "pre_fusion_latent_probe"
+    explain_dir.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(explain_dir / "latent_feature_importance.csv", index=False)
+    selected_frame = frame[frame["selected"]].copy()
+    selected_frame.to_csv(explain_dir / f"latent_top{k}_features.csv", index=False)
+    _save_topk_heatmap(
+        explain_dir / f"latent_top{k}_importance_heatmap.png",
+        selected_frame,
+        "importance",
+        top_k=k,
+    )
+    matrix = np.stack([importance[:latent_dim], importance[latent_dim:]], axis=0)
+    _save_heatmap(
+        explain_dir / "latent_importance_by_branch_heatmap.png",
+        matrix,
+        [str(idx) for idx in range(latent_dim)],
+        ["temporal", "expert-statistical"],
+    )
+    temporal_selected = int((selected_frame["branch"] == "temporal").sum())
+    statistical_selected = int((selected_frame["branch"] == "expert_statistical").sum())
+    temporal_mass = float(importance[:latent_dim].sum())
+    statistical_mass = float(importance[latent_dim:].sum())
+    summary = pd.DataFrame(
+        [
+            {
+                "top_k": k,
+                "temporal_selected": temporal_selected,
+                "expert_statistical_selected": statistical_selected,
+                "temporal_importance_sum": temporal_mass,
+                "expert_statistical_importance_sum": statistical_mass,
+                "selector_rows": int(len(selector_y)),
+                "selector_positive_rows": int((selector_y > 0).sum()),
+            }
+        ]
+    )
+    summary.to_csv(explain_dir / "latent_branch_summary.csv", index=False)
+    _save_latent_branch_composition(
+        explain_dir / f"latent_top{k}_branch_composition.png",
+        temporal_selected,
+        statistical_selected,
+    )
+    meta = {
+        **summary.iloc[0].to_dict(),
+        "selector": "extra_trees",
+        "selector_estimators": int(args.latent_probe_estimators),
+        "selector_seconds": float(time.time() - started),
+        "selected_indices": selected_indices,
+        "selected_features": [feature_names[index] for index in selected_indices],
+    }
+    (explain_dir / "latent_probe_manifest.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return selected_indices, meta
+
+
+def save_pre_fusion_probe_importance(
+    estimator: Any,
+    selected_names: list[str],
+    run_dir: Path,
+    top_k: int,
+) -> None:
+    scores = getattr(estimator, "feature_importances_", None)
+    if scores is None:
+        return
+    frame = _save_score_table(
+        run_dir / "explainability" / "pre_fusion_latent_probe" / f"top{int(top_k)}_xgb_importance.csv",
+        selected_names,
+        np.asarray(scores, dtype=float),
+        "importance",
+    )
+    _save_topk_heatmap(
+        run_dir / "explainability" / "pre_fusion_latent_probe" / f"top{int(top_k)}_xgb_importance_heatmap.png",
+        frame,
+        "importance",
+        top_k=int(top_k),
+    )
 
 
 def summarize_tsf_explainability(
@@ -1098,6 +1724,39 @@ def build_aligned_xgb_model(args: argparse.Namespace, y_train: np.ndarray, seed:
     return estimator, meta
 
 
+def build_decision_model(args: argparse.Namespace, y_train: np.ndarray, seed: int) -> tuple[Any, dict[str, Any]]:
+    decision_layer = str(args.decision_layer).lower()
+    if decision_layer == "xgb":
+        estimator, meta = build_aligned_xgb_model(args, y_train, seed)
+    else:
+        estimator = build_ml_model(decision_layer, args, y_train, seed)
+        meta = {
+            "xgb_balance_mode": "not_applicable",
+            "xgb_scale_pos_weight": 1.0,
+            "xgb_raw_scale_pos_weight": 1.0,
+        }
+    meta["decision_layer"] = decision_layer
+    return estimator, meta
+
+
+def fit_decision_model(
+    estimator: Any,
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    sample_weight: np.ndarray,
+    use_sample_weight: bool,
+) -> bool:
+    if not use_sample_weight:
+        estimator.fit(x_train, y_train)
+        return False
+    try:
+        estimator.fit(x_train, y_train, sample_weight=sample_weight)
+        return True
+    except TypeError:
+        estimator.fit(x_train, y_train)
+        return False
+
+
 def score_fused_files_to_memory(
     estimator: Any,
     model: TemporalStatAligner,
@@ -1131,7 +1790,7 @@ def score_fused_files_to_memory(
                     "timestamp": block["timestamps"].astype(np.int64),
                     "score": score.astype(np.float32),
                     "rule_predict": block["rule_pred"].astype(int),
-                    "source": "aligned_latent_xgb",
+                    "source": RUN_NAME,
                 }
             )
         ]
@@ -1160,6 +1819,253 @@ def score_fused_files_to_memory(
     return frames
 
 
+def score_pre_fusion_latent_files_to_memory(
+    estimator: Any,
+    selected_indices: list[int],
+    model: TemporalStatAligner,
+    cache: Model2FeatureCache,
+    file_names: list[str],
+    cfg: CompatCfg,
+    raw_indices: list[int],
+    stat_indices: list[int],
+    stat_input_indices: list[int],
+    temporal_summary_mode: str,
+    fold: int,
+    stage_name: str,
+    top_k: int,
+) -> dict[str, pd.DataFrame]:
+    frames: dict[str, pd.DataFrame] = {}
+    selected = np.asarray(selected_indices, dtype=np.int64)
+    started = log_stage_start(stage_name, RUN_NAME, fold, files=len(file_names), top_k=int(top_k))
+    for idx, file_name in enumerate(file_names, 1):
+        block = encode_file_positions(
+            model,
+            cache,
+            file_name,
+            cfg,
+            raw_indices,
+            stat_indices,
+            stat_input_indices,
+            temporal_summary_mode,
+            return_branch_latents=True,
+        )
+        pre_fusion = np.concatenate(
+            [block["temporal_latent"], block["statistical_latent"]],
+            axis=1,
+        ).astype(np.float32)
+        score = (
+            positive_scores(estimator, pre_fusion[:, selected])
+            if len(pre_fusion) > 0
+            else np.zeros(0, dtype=np.float32)
+        )
+        parts = [
+            pd.DataFrame(
+                {
+                    "timestamp": block["timestamps"].astype(np.int64),
+                    "score": score.astype(np.float32),
+                    "rule_predict": block["rule_pred"].astype(int),
+                    "source": f"pre_fusion_latent_top{int(top_k)}",
+                }
+            )
+        ]
+        extra = block["extra"]
+        if len(extra):
+            parts.append(
+                pd.DataFrame(
+                    {
+                        "timestamp": extra[:, 0].astype(np.int64),
+                        "score": np.nan,
+                        "rule_predict": extra[:, 1].astype(int),
+                        "source": "model2_extra_rule",
+                    }
+                )
+            )
+        frames[file_name] = pd.concat(parts, ignore_index=True).sort_values("timestamp")
+        if idx % 200 == 0:
+            elapsed = time.time() - started
+            print(
+                f"[stage-progress] model={RUN_NAME} fold={fold} stage={stage_name} "
+                f"{progress_bar(idx, len(file_names), width=18)} files={idx}/{len(file_names)} "
+                f"rate={format_rate(idx, elapsed)} elapsed={format_duration(elapsed)}",
+                flush=True,
+            )
+    log_stage_done(stage_name, started, RUN_NAME, fold)
+    return frames
+
+
+def run_pre_fusion_latent_probe(
+    model: TemporalStatAligner,
+    cache: Model2FeatureCache,
+    dataset: CompatBatchedDataset,
+    train_meta: dict[str, Any],
+    val_files: list[str],
+    test_files: list[str],
+    cfg: CompatCfg,
+    raw_indices: list[int],
+    stat_indices: list[int],
+    stat_input_indices: list[int],
+    temporal_summary_mode: str,
+    fold: int,
+    run_dir: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    top_k = int(args.latent_probe_topk)
+    x_train, y_train, sample_weight, latent_names = collect_pre_fusion_training_table(
+        model,
+        cache,
+        dataset,
+        cfg,
+        raw_indices,
+        stat_indices,
+        stat_input_indices,
+        temporal_summary_mode,
+        int(fold),
+    )
+    selected_indices, selector_meta = select_pre_fusion_latent_features(
+        x_train,
+        y_train,
+        latent_names,
+        top_k,
+        args,
+        int(fold),
+        run_dir,
+    )
+    selected_names = [latent_names[index] for index in selected_indices]
+    x_selected = np.ascontiguousarray(x_train[:, np.asarray(selected_indices, dtype=np.int64)])
+    estimator, decision_meta = build_decision_model(args, y_train, int(args.seed) + int(fold) + 4001)
+    train_started = log_stage_start(
+        "latent_probe_train",
+        RUN_NAME,
+        fold,
+        rows=len(y_train),
+        features=x_selected.shape[1],
+        decision_layer=args.decision_layer,
+    )
+    sample_weight_used = fit_decision_model(
+        estimator,
+        x_selected,
+        y_train,
+        sample_weight,
+        bool(args.xgb_use_sample_weight),
+    )
+    decision_meta["sample_weight_used"] = bool(sample_weight_used)
+    log_stage_done("latent_probe_train", train_started, RUN_NAME, fold)
+    probe_dir = run_dir / "latent_probe"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    model_path = probe_dir / f"pre_fusion_top{top_k}_{str(args.decision_layer).lower()}.pkl"
+    with model_path.open("wb") as fh:
+        pickle.dump(
+            {
+                "model": estimator,
+                "feature_names": selected_names,
+                "selected_indices": selected_indices,
+                "selector_meta": selector_meta,
+                "decision_meta": decision_meta,
+            },
+            fh,
+        )
+    save_pre_fusion_probe_importance(estimator, selected_names, run_dir, top_k)
+    del x_train, x_selected
+    gc.collect()
+
+    val_scores = score_pre_fusion_latent_files_to_memory(
+        estimator,
+        selected_indices,
+        model,
+        cache,
+        val_files,
+        cfg,
+        raw_indices,
+        stat_indices,
+        stat_input_indices,
+        temporal_summary_mode,
+        int(fold),
+        "latent_probe_score_val",
+        top_k,
+    )
+    test_started = time.time()
+    test_scores = score_pre_fusion_latent_files_to_memory(
+        estimator,
+        selected_indices,
+        model,
+        cache,
+        test_files,
+        cfg,
+        raw_indices,
+        stat_indices,
+        stat_input_indices,
+        temporal_summary_mode,
+        int(fold),
+        "latent_probe_score_test",
+        top_k,
+    )
+    test_score_seconds = float(time.time() - test_started)
+    scored_test_rows = int(sum(len(frame) for frame in test_scores.values()))
+    tag = f"pre_fusion_latent_top{top_k}_{str(args.decision_layer).lower()}"
+    threshold, val_metrics = select_threshold_for_scores(val_scores, args.data_dir, run_dir, tag, args)
+    pred_dir = run_dir / "predictions" / tag
+    eval_dir = run_dir / "evaluation" / tag
+    test_rows = write_threshold_predictions(test_scores, pred_dir, threshold)
+    metrics, _detail = evaluate_prediction_output(pred_dir, args.data_dir, eval_dir, args.min_hit_lead_hours)
+    print(
+        f"[latent-probe-done] fold={fold} top_k={top_k} threshold={threshold:.4f} "
+        f"temporal_selected={int(selector_meta['temporal_selected'])} "
+        f"expert_stat_selected={int(selector_meta['expert_statistical_selected'])} "
+        f"{format_metric_summary(metrics)}",
+        flush=True,
+    )
+    del val_scores, test_scores
+    gc.collect()
+    return {
+        "deep_model": RUN_NAME,
+        "method_family": "HTSF latent probe",
+        "method_label": f"{args.method_label or 'HTSF'} pre-fusion Top-{top_k}",
+        "experiment_id": f"{args.experiment_id}_latent_top{top_k}".strip("_"),
+        "temporal_encoder": args.temporal_encoder,
+        "fold": int(fold),
+        "mode": tag,
+        "ml_model": args.decision_layer,
+        "decision_layer": args.decision_layer,
+        "ml_feature_set": "pre_fusion_latent_topk",
+        "selector": "extra_trees",
+        "selected_feature_count": top_k,
+        "fusion_mode": "pre_fusion_latent_topk",
+        "tsf_ablation": "latent_probe",
+        "xgb_balance_mode": args.xgb_balance_mode,
+        "xgb_use_sample_weight": bool(args.xgb_use_sample_weight),
+        "xgb_scale_pos_weight": float(decision_meta.get("xgb_scale_pos_weight", 1.0)),
+        "threshold": float(threshold),
+        "latent_probe_topk": top_k,
+        "latent_probe_temporal_selected": int(selector_meta["temporal_selected"]),
+        "latent_probe_statistical_selected": int(selector_meta["expert_statistical_selected"]),
+        "latent_probe_temporal_importance": float(selector_meta["temporal_importance_sum"]),
+        "latent_probe_statistical_importance": float(selector_meta["expert_statistical_importance_sum"]),
+        "stat_selector": args.stat_selector,
+        "stat_select_k": int(args.stat_select_k),
+        "temporal_selector": args.temporal_selector,
+        "temporal_select_k": int(args.temporal_select_k),
+        "total_select_k": int(args.total_select_k),
+        "temporal_summary_mode": args.temporal_summary_mode,
+        "stat_feature_count": int(train_meta.get("stat_feature_selection", {}).get("selected_stat_feature_count", 0)),
+        "sample_selection": args.sample_selection,
+        "sample_topk_fraction": float(args.sample_topk_fraction),
+        "temporal_positive_weight": float(args.temporal_positive_weight),
+        "adaptive_negative_weight": float(args.adaptive_negative_weight),
+        "train_rows": int(train_meta.get("train_rows", 0)),
+        "train_pos_rows": int(train_meta.get("train_pos_rows", 0)),
+        "train_neg_rows": int(train_meta.get("train_neg_rows", 0)),
+        "test_score_seconds": test_score_seconds,
+        "scored_test_rows": scored_test_rows,
+        "scoring_rows_per_second": float(scored_test_rows / max(test_score_seconds, 1e-9)),
+        "scoring_ms_per_window": float(1000.0 * test_score_seconds / max(scored_test_rows, 1)),
+        "encoder_model_mb": float((run_dir / "aligned_encoder.pt").stat().st_size / (1024.0 * 1024.0)),
+        "decision_model_mb": float(model_path.stat().st_size / (1024.0 * 1024.0)),
+        "val_metrics": val_metrics,
+        "test_rows": int(test_rows),
+        "metrics": metrics,
+    }
+
+
 def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
     cfg = CompatCfg(
         seq_len=args.seq_len,
@@ -1173,7 +2079,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         fixed_threshold=args.fixed_threshold,
         target_mode=args.target_mode,
         feature_mode=args.feature_mode,
-        sampling_mode=args.sampling_mode,
+        sampling_mode="row_ratio" if str(args.sampling_mode).lower() == "row" else args.sampling_mode,
         positive_windows_per_module=args.positive_windows_per_module,
         negative_windows_per_faulty_module=args.negative_windows_per_faulty_module,
         normal_windows_per_module=args.normal_windows_per_module,
@@ -1189,6 +2095,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         adaptive_negative_weight=args.adaptive_negative_weight,
         adaptive_warmup_epochs=args.adaptive_warmup_epochs,
         max_cached_files=args.max_cached_files,
+        module_cache_dir=str(args.module_cache_dir) if args.module_cache_dir else "",
         seed=args.seed,
         device=args.device,
         num_workers=args.num_workers,
@@ -1212,18 +2119,24 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
     train_files, val_files = split_train_val_files(train_files, label_by_file, cfg, int(fold))
     run_dir = Path(args.out_root) / RUN_NAME / f"fold_{fold}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    resolved_mode = resolve_fusion_mode(args.fusion_mode, args.tsf_ablation)
     log_run_header(
-        "TSF-XGBOOST TEMPORAL-STAT ALIGNMENT",
+        "HYBRID TEMPORAL-STATISTICAL FUSION",
         {
+            "experiment id": args.experiment_id or "default",
             "temporal encoder": args.temporal_encoder,
+            "decision layer": args.decision_layer,
             "fold": fold,
             "train/val/test": f"{len(train_files)}/{len(val_files)}/{len(test_files)} modules",
             "target": cfg.target_mode,
             "feature mode": cfg.feature_mode,
             "stat features": args.stat_feature_mode,
+            "stat feature groups": args.stat_feature_groups or "legacy-mode selection",
+            "excluded stat groups": args.exclude_stat_feature_groups or "none",
             "temporal summaries": args.temporal_summary_mode,
-            "fusion mode": args.fusion_mode,
+            "fusion mode": resolved_mode,
             "tsf ablation": args.tsf_ablation,
+            "latent probe top-k": int(args.latent_probe_topk) if int(args.latent_probe_topk) > 0 else "disabled",
             "rule mode": cfg.rule_mode,
             "sample selection": cfg.sample_selection,
             "xgb balance": args.xgb_balance_mode,
@@ -1236,20 +2149,38 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         },
     )
     stats_started = log_stage_start("feature_norm_stats", RUN_NAME, fold, files=len(train_files), data_dir=args.data_dir)
-    stats = compute_feature_norm_stats(args.data_dir, train_files, cfg, label_by_file)
+    stats = load_or_compute_feature_norm_stats(args.data_dir, train_files, cfg, label_by_file)
     log_stage_done("feature_norm_stats", stats_started, RUN_NAME, fold)
     mean, std = stats.arrays()
     cache = Model2FeatureCache(args.data_dir, mean, std, cfg, label_by_file)
     names = compat_feature_names(cfg)
-    raw_indices, raw_names, stat_indices, stat_names = feature_indices(names, args.stat_feature_mode)
-    stat_candidate_feature_names = stat_candidate_names(stat_names, raw_names, str(args.temporal_summary_mode))
+    all_raw_indices, all_raw_names, stat_indices, stat_names = feature_indices(
+        names,
+        args.stat_feature_mode,
+        args.stat_feature_groups,
+        args.exclude_stat_feature_groups,
+    )
+    stat_candidate_feature_names = stat_candidate_names(
+        stat_names,
+        all_raw_names,
+        str(args.temporal_summary_mode),
+    )
     original_stat_feature_count = len(stat_candidate_feature_names)
-    model, dataset, train_meta, stat_input_indices, stat_input_names, stat_candidate_feature_names = train_fusion_encoder(
+    (
+        model,
+        dataset,
+        train_meta,
+        raw_indices,
+        raw_names,
+        stat_input_indices,
+        stat_input_names,
+        stat_candidate_feature_names,
+    ) = train_fusion_encoder(
         train_files,
         cache,
         cfg,
-        raw_indices,
-        raw_names,
+        all_raw_indices,
+        all_raw_names,
         stat_indices,
         stat_names,
         args,
@@ -1260,6 +2191,9 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         json.dumps(
             {
                 "temporal_encoder": args.temporal_encoder,
+                "decision_layer": args.decision_layer,
+                "experiment_id": args.experiment_id,
+                "raw_sequence_feature_candidates": all_raw_names,
                 "raw_sequence_features": raw_names,
                 "base_statistic_features": stat_names,
                 "statistic_feature_candidates": stat_candidate_feature_names,
@@ -1267,6 +2201,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
                 "temporal_summary_mode": args.temporal_summary_mode,
                 "temporal_summary_features": temporal_summary_feature_names(raw_names, str(args.temporal_summary_mode)),
                 "feature_group_counts": {
+                    "raw_sequence_features_original": len(all_raw_names),
                     "raw_sequence_features": len(raw_names),
                     "raw_sequence_window_values": len(raw_names) * int(cfg.seq_len),
                     "base_statistic_features": len(stat_names),
@@ -1278,6 +2213,8 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
                     "fused_latent_dim": int(args.latent_dim),
                 },
                 "all_compat_features": names,
+                "all_feature_groups": feature_group_manifest(names),
+                "selected_stat_feature_groups": feature_group_manifest(stat_input_names),
                 "train_meta": train_meta,
             },
             indent=2,
@@ -1291,13 +2228,14 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
             "temporal_encoder": args.temporal_encoder,
             "temporal_encoder_cfg": model.temporal_encoder_cfg,
             "patchtst_cfg": model.temporal_encoder_cfg if str(args.temporal_encoder) == "patchtst" else None,
+            "raw_feature_candidates": all_raw_names,
             "raw_features": raw_names,
             "base_stat_features": stat_names,
             "stat_feature_candidates": stat_candidate_feature_names,
             "stat_features": stat_input_names,
             "stat_input_indices": stat_input_indices,
             "temporal_summary_mode": args.temporal_summary_mode,
-            "fusion_mode": args.fusion_mode,
+            "fusion_mode": resolved_mode,
             "tsf_ablation": args.tsf_ablation,
             "train_meta": train_meta,
         },
@@ -1327,25 +2265,33 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         run_dir,
         args,
     )
-    estimator, xgb_meta = build_aligned_xgb_model(args, y_train, int(args.seed) + int(fold))
+    estimator, decision_meta = build_decision_model(args, y_train, int(args.seed) + int(fold))
     ml_started = log_stage_start(
-        "xgb_train_on_fused_latent",
+        "decision_train_on_fused_latent",
         RUN_NAME,
         fold,
         rows=len(y_train),
         features=x_train.shape[1],
-        balance=args.xgb_balance_mode,
-        scale_pos_weight=f"{float(xgb_meta.get('xgb_scale_pos_weight', 1.0)):.4f}",
+        decision_layer=args.decision_layer,
+        balance=decision_meta.get("xgb_balance_mode", "not_applicable"),
+        scale_pos_weight=f"{float(decision_meta.get('xgb_scale_pos_weight', 1.0)):.4f}",
         sample_weight=bool(args.xgb_use_sample_weight),
     )
-    if bool(args.xgb_use_sample_weight):
-        estimator.fit(x_train, y_train, sample_weight=sample_weight)
-    else:
-        estimator.fit(x_train, y_train)
-    log_stage_done("xgb_train_on_fused_latent", ml_started, RUN_NAME, fold)
-    save_xgb_latent_importance(estimator, latent_names, run_dir)
-    with (run_dir / "xgb_fused_latent.pkl").open("wb") as fh:
-        pickle.dump({"model": estimator, "feature_names": latent_names, "xgb_meta": xgb_meta}, fh)
+    sample_weight_used = fit_decision_model(
+        estimator,
+        x_train,
+        y_train,
+        sample_weight,
+        bool(args.xgb_use_sample_weight),
+    )
+    decision_meta["sample_weight_used"] = bool(sample_weight_used)
+    log_stage_done("decision_train_on_fused_latent", ml_started, RUN_NAME, fold)
+    save_decision_latent_importance(estimator, latent_names, run_dir)
+    with (run_dir / "decision_layer.pkl").open("wb") as fh:
+        pickle.dump({"model": estimator, "feature_names": latent_names, "decision_meta": decision_meta}, fh)
+    if str(args.decision_layer).lower() == "xgb":
+        with (run_dir / "xgb_fused_latent.pkl").open("wb") as fh:
+            pickle.dump({"model": estimator, "feature_names": latent_names, "xgb_meta": decision_meta}, fh)
     val_scores = score_fused_files_to_memory(
         estimator,
         model,
@@ -1359,6 +2305,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         int(fold),
         "score_val_files",
     )
+    test_score_started = time.time()
     test_scores = score_fused_files_to_memory(
         estimator,
         model,
@@ -1372,9 +2319,14 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         int(fold),
         "score_test_files",
     )
-    threshold, val_metrics = select_threshold_for_scores(val_scores, args.data_dir, run_dir, "aligned_latent_xgb", args)
-    pred_dir = run_dir / "predictions" / "aligned_latent_xgb"
-    eval_dir = run_dir / "evaluation" / "aligned_latent_xgb"
+    test_score_seconds = float(time.time() - test_score_started)
+    scored_test_rows = int(sum(len(frame) for frame in test_scores.values()))
+    scoring_rows_per_second = scored_test_rows / max(test_score_seconds, 1e-9)
+    scoring_ms_per_window = 1000.0 * test_score_seconds / max(scored_test_rows, 1)
+    decision_tag = f"aligned_latent_{str(args.decision_layer).lower()}"
+    threshold, val_metrics = select_threshold_for_scores(val_scores, args.data_dir, run_dir, decision_tag, args)
+    pred_dir = run_dir / "predictions" / decision_tag
+    eval_dir = run_dir / "evaluation" / decision_tag
     test_rows = write_threshold_predictions(test_scores, pred_dir, threshold)
     metrics, _detail = evaluate_prediction_output(pred_dir, args.data_dir, eval_dir, args.min_hit_lead_hours)
     if str(args.lead_time_grid).strip():
@@ -1383,7 +2335,7 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
             test_scores,
             args.data_dir,
             run_dir,
-            "aligned_latent_xgb",
+            decision_tag,
             int(fold),
             args.lead_time_grid,
             args.threshold_grid,
@@ -1392,12 +2344,14 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
             bool(args.threshold_search),
             metadata={
                 "run_name": RUN_NAME,
+                "experiment_id": args.experiment_id,
                 "temporal_encoder": args.temporal_encoder,
-                "mode": "aligned_latent_xgb",
+                "decision_layer": args.decision_layer,
+                "mode": decision_tag,
                 "feature_mode": args.feature_mode,
                 "stat_feature_mode": args.stat_feature_mode,
                 "temporal_summary_mode": args.temporal_summary_mode,
-                "fusion_mode": args.fusion_mode,
+                "fusion_mode": resolved_mode,
                 "tsf_ablation": args.tsf_ablation,
                 "rule_mode": cfg.rule_mode,
                 "xgb_balance_mode": args.xgb_balance_mode,
@@ -1406,36 +2360,83 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         )
         append_lead_time_sweep_results(sweep_rows, Path(args.out_root))
     print(f"[aligned-done] fold={fold} threshold={threshold:.4f} rows={test_rows} {format_metric_summary(metrics)}", flush=True)
+    decision_feature_count = int(x_train.shape[1])
     result = {
         "deep_model": RUN_NAME,
+        "method_family": "HTSF",
+        "method_label": args.method_label or "HTSF",
+        "experiment_id": args.experiment_id,
         "temporal_encoder": args.temporal_encoder,
         "fold": int(fold),
-        "mode": "aligned_latent_xgb",
-        "ml_model": "xgb",
+        "mode": decision_tag,
+        "ml_model": args.decision_layer,
+        "decision_layer": args.decision_layer,
         "ml_feature_set": "aligned_latent",
         "selector": "none",
-        "selected_feature_count": int(x_train.shape[1]),
-        "fusion_mode": args.fusion_mode,
+        "selected_feature_count": decision_feature_count,
+        "fusion_mode": resolved_mode,
         "tsf_ablation": args.tsf_ablation,
         "xgb_balance_mode": args.xgb_balance_mode,
         "xgb_use_sample_weight": bool(args.xgb_use_sample_weight),
-        "xgb_scale_pos_weight": float(xgb_meta.get("xgb_scale_pos_weight", 1.0)),
+        "xgb_scale_pos_weight": float(decision_meta.get("xgb_scale_pos_weight", 1.0)),
         "threshold": float(threshold),
+        "temporal_selector": args.temporal_selector,
+        "temporal_select_k": int(args.temporal_select_k),
         "stat_selector": args.stat_selector,
         "stat_select_k": int(args.stat_select_k),
+        "total_select_k": int(args.total_select_k),
         "temporal_summary_mode": args.temporal_summary_mode,
+        "temporal_feature_count": len(raw_names),
         "stat_feature_count": len(stat_input_names),
+        "selected_input_feature_count": len(raw_names) + len(stat_input_names),
+        "stat_feature_groups": args.stat_feature_groups,
+        "exclude_stat_feature_groups": args.exclude_stat_feature_groups,
+        "sample_selection": args.sample_selection,
+        "sample_topk_fraction": float(args.sample_topk_fraction),
+        "temporal_positive_weight": float(args.temporal_positive_weight),
+        "adaptive_negative_weight": float(args.adaptive_negative_weight),
+        "train_rows": int(train_meta.get("train_rows", 0)),
+        "train_pos_rows": int(train_meta.get("train_pos_rows", 0)),
+        "train_neg_rows": int(train_meta.get("train_neg_rows", 0)),
+        "test_score_seconds": test_score_seconds,
+        "scored_test_rows": scored_test_rows,
+        "scoring_rows_per_second": float(scoring_rows_per_second),
+        "scoring_ms_per_window": float(scoring_ms_per_window),
+        "encoder_model_mb": float((run_dir / "aligned_encoder.pt").stat().st_size / (1024.0 * 1024.0)),
+        "decision_model_mb": float((run_dir / "decision_layer.pkl").stat().st_size / (1024.0 * 1024.0)),
         "val_metrics": val_metrics,
         "test_rows": int(test_rows),
         "metrics": metrics,
     }
+    results = [result]
+    del x_train, val_scores, test_scores
+    gc.collect()
+    if int(args.latent_probe_topk) > 0:
+        results.append(
+            run_pre_fusion_latent_probe(
+                model,
+                cache,
+                dataset,
+                train_meta,
+                val_files,
+                test_files,
+                cfg,
+                raw_indices,
+                stat_indices,
+                stat_input_indices,
+                str(args.temporal_summary_mode),
+                int(fold),
+                run_dir,
+                args,
+            )
+        )
     print(f"[fold-done] run={RUN_NAME} fold={fold} elapsed={format_duration(time.time() - fold_started)}", flush=True)
     model.close()
     del model, cache, dataset
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return [result]
+    return results
 
 
 def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argparse.Namespace) -> None:
@@ -1443,10 +2444,14 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
     for item in results:
         row = {
             "deep_model": item["deep_model"],
+            "method_family": item.get("method_family", "HTSF"),
+            "method_label": item.get("method_label", getattr(args, "method_label", "HTSF")),
+            "experiment_id": item.get("experiment_id", getattr(args, "experiment_id", "")),
             "temporal_encoder": item.get("temporal_encoder", getattr(args, "temporal_encoder", "")),
             "fold": int(item["fold"]),
             "mode": item["mode"],
             "ml_model": item.get("ml_model", ""),
+            "decision_layer": item.get("decision_layer", getattr(args, "decision_layer", "xgb")),
             "ml_feature_set": item.get("ml_feature_set", ""),
             "selector": item.get("selector", ""),
             "selected_feature_count": int(item.get("selected_feature_count", 0)),
@@ -1460,13 +2465,45 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
             "feature_mode": args.feature_mode,
             "stat_feature_mode": args.stat_feature_mode,
             "temporal_summary_mode": item.get("temporal_summary_mode", args.temporal_summary_mode),
+            "temporal_selector": item.get("temporal_selector", args.temporal_selector),
+            "temporal_select_k": int(item.get("temporal_select_k", args.temporal_select_k)),
             "stat_selector": item.get("stat_selector", args.stat_selector),
             "stat_select_k": int(item.get("stat_select_k", args.stat_select_k)),
+            "total_select_k": int(item.get("total_select_k", args.total_select_k)),
+            "latent_probe_topk": int(item.get("latent_probe_topk", 0)),
+            "latent_probe_temporal_selected": int(item.get("latent_probe_temporal_selected", 0)),
+            "latent_probe_statistical_selected": int(item.get("latent_probe_statistical_selected", 0)),
+            "latent_probe_temporal_importance": float(item.get("latent_probe_temporal_importance", 0.0)),
+            "latent_probe_statistical_importance": float(item.get("latent_probe_statistical_importance", 0.0)),
+            "temporal_feature_count": int(item.get("temporal_feature_count", 0)),
             "stat_feature_count": int(item.get("stat_feature_count", 0)),
+            "selected_input_feature_count": int(item.get("selected_input_feature_count", 0)),
+            "stat_feature_groups": item.get("stat_feature_groups", getattr(args, "stat_feature_groups", "")),
+            "exclude_stat_feature_groups": item.get(
+                "exclude_stat_feature_groups",
+                getattr(args, "exclude_stat_feature_groups", ""),
+            ),
             "sampling_mode": args.sampling_mode,
+            "sample_selection": item.get("sample_selection", args.sample_selection),
+            "sample_topk_fraction": float(item.get("sample_topk_fraction", args.sample_topk_fraction)),
+            "temporal_positive_weight": float(
+                item.get("temporal_positive_weight", args.temporal_positive_weight)
+            ),
+            "adaptive_negative_weight": float(
+                item.get("adaptive_negative_weight", args.adaptive_negative_weight)
+            ),
             "rule_mode": args.rule_mode,
             "min_hit_lead_hours": float(args.min_hit_lead_hours),
             "test_rows": int(item.get("test_rows", 0)),
+            "train_rows": int(item.get("train_rows", 0)),
+            "train_pos_rows": int(item.get("train_pos_rows", 0)),
+            "train_neg_rows": int(item.get("train_neg_rows", 0)),
+            "test_score_seconds": float(item.get("test_score_seconds", 0.0)),
+            "scored_test_rows": int(item.get("scored_test_rows", 0)),
+            "scoring_rows_per_second": float(item.get("scoring_rows_per_second", 0.0)),
+            "scoring_ms_per_window": float(item.get("scoring_ms_per_window", 0.0)),
+            "encoder_model_mb": float(item.get("encoder_model_mb", 0.0)),
+            "decision_model_mb": float(item.get("decision_model_mb", 0.0)),
         }
         row.update(item.get("metrics", {}))
         rows.append(row)
@@ -1478,22 +2515,39 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
     if path.exists():
         old = pd.read_csv(path)
         frame = pd.concat([old, frame], ignore_index=True)
+        dedupe_cols = [
+            "deep_model",
+            "experiment_id",
+            "temporal_encoder",
+            "fold",
+            "mode",
+            "decision_layer",
+            "stat_feature_mode",
+            "stat_feature_groups",
+            "exclude_stat_feature_groups",
+            "temporal_summary_mode",
+            "temporal_selector",
+            "temporal_select_k",
+            "stat_selector",
+            "stat_select_k",
+            "total_select_k",
+            "latent_probe_topk",
+            "fusion_mode",
+            "tsf_ablation",
+            "xgb_balance_mode",
+            "xgb_use_sample_weight",
+            "sampling_mode",
+            "sample_selection",
+            "sample_topk_fraction",
+            "temporal_positive_weight",
+            "adaptive_negative_weight",
+            "rule_mode",
+        ]
+        for col in dedupe_cols:
+            if col in frame.columns and (pd.api.types.is_object_dtype(frame[col]) or pd.api.types.is_string_dtype(frame[col])):
+                frame[col] = frame[col].fillna("")
         frame.drop_duplicates(
-            subset=[
-                "deep_model",
-                "temporal_encoder",
-                "fold",
-                "mode",
-                "stat_feature_mode",
-                "temporal_summary_mode",
-                "stat_selector",
-                "stat_select_k",
-                "fusion_mode",
-                "tsf_ablation",
-                "xgb_balance_mode",
-                "xgb_use_sample_weight",
-                "rule_mode",
-            ],
+            subset=dedupe_cols,
             keep="last",
             inplace=True,
         )
@@ -1501,17 +2555,31 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
     frame.to_csv(path, index=False)
     group_cols = [
         "deep_model",
+        "method_family",
+        "method_label",
+        "experiment_id",
         "temporal_encoder",
         "mode",
+        "decision_layer",
         "target_mode",
         "feature_mode",
         "stat_feature_mode",
+        "stat_feature_groups",
+        "exclude_stat_feature_groups",
         "temporal_summary_mode",
+        "temporal_selector",
+        "temporal_select_k",
         "stat_selector",
         "stat_select_k",
+        "total_select_k",
+        "latent_probe_topk",
         "fusion_mode",
         "tsf_ablation",
         "sampling_mode",
+        "sample_selection",
+        "sample_topk_fraction",
+        "temporal_positive_weight",
+        "adaptive_negative_weight",
         "rule_mode",
         "xgb_balance_mode",
         "xgb_use_sample_weight",
@@ -1526,8 +2594,10 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Temporal encoder + statistic MLP feature alignment + cross-attention + XGBoost."
+        description="HTSF dual-view representation learning with a replaceable temporal encoder and decision layer."
     )
+    parser.add_argument("--experiment_id", default="")
+    parser.add_argument("--method_label", default="HTSF")
     parser.add_argument(
         "--temporal_encoder",
         choices=list(TEMPORAL_ENCODERS),
@@ -1547,29 +2617,69 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--negative_ratio", type=float, default=10.0)
     parser.add_argument("--pos_weight_cap", type=float, default=20.0)
     parser.add_argument("--fixed_threshold", type=float, default=0.3)
-    parser.add_argument("--target_mode", choices=["ahead120", "anomaly", "module_fault"], default="module_fault")
-    parser.add_argument("--feature_mode", choices=["model2", "model2_plus"], default="model2_plus")
-    parser.add_argument("--stat_feature_mode", choices=["all_engineered", "model2_expert", "statistics", "all"], default="all_engineered")
+    parser.add_argument("--target_mode", choices=["ahead120", "anomaly", "module_fault"], default="ahead120")
+    parser.add_argument(
+        "--feature_mode",
+        choices=["model2", "model2_plus", "ofp", "ofp_plus"],
+        default="ofp",
+    )
+    parser.add_argument(
+        "--stat_feature_mode",
+        choices=["ofp_expert_stat", "all_engineered", "model2_expert", "statistics", "all"],
+        default="ofp_expert_stat",
+    )
+    parser.add_argument(
+        "--stat_feature_groups",
+        default="",
+        help="Comma-separated semantic feature groups or aliases from OFP/model2/ExperimentFeatureSchema.py.",
+    )
+    parser.add_argument(
+        "--exclude_stat_feature_groups",
+        default="",
+        help="Comma-separated semantic groups removed after --stat_feature_groups is expanded.",
+    )
     parser.add_argument(
         "--temporal_summary_mode",
         choices=list(TEMPORAL_SUMMARY_MODES),
         default="none",
         help="Optional temporal raw-channel summary features added to the statistic/expert branch candidate pool.",
     )
+    parser.add_argument("--temporal_selector", choices=["none", "extra_trees"], default="none")
+    parser.add_argument("--temporal_select_k", type=int, default=0)
+    parser.add_argument("--temporal_selector_estimators", type=int, default=200)
+    parser.add_argument("--temporal_selector_max_rows", type=int, default=200000)
     parser.add_argument("--stat_selector", choices=["none", "extra_trees"], default="none")
     parser.add_argument("--stat_select_k", type=int, default=0)
     parser.add_argument("--stat_selector_estimators", type=int, default=200)
     parser.add_argument("--stat_selector_max_rows", type=int, default=200000)
-    parser.add_argument("--sampling_mode", choices=["row", "module_balanced"], default="module_balanced")
+    parser.add_argument(
+        "--total_select_k",
+        type=int,
+        default=0,
+        help=(
+            "Total number of selected raw temporal channels plus expert-statistical features. "
+            "When positive, --temporal_select_k is required and the remaining budget is assigned "
+            "to the expert-statistical branch."
+        ),
+    )
+    parser.add_argument(
+        "--sampling_mode",
+        choices=["row", "row_ratio", "module_balanced"],
+        default="module_balanced",
+    )
     parser.add_argument("--positive_windows_per_module", type=int, default=32)
     parser.add_argument("--negative_windows_per_faulty_module", type=int, default=8)
     parser.add_argument("--normal_windows_per_module", type=int, default=8)
-    parser.add_argument("--rule_mode", choices=["none", "temp", "model2_simple"], default="model2_simple")
+    parser.add_argument(
+        "--rule_mode",
+        choices=["none", "temp", "model2_simple", "ofp_rules"],
+        default="none",
+    )
     parser.add_argument("--sample_selection", choices=["random", "signal_topk", "hybrid"], default="hybrid")
     parser.add_argument("--sample_topk_fraction", type=float, default=0.5)
-    parser.add_argument("--temporal_positive_weight", type=float, default=2.0)
+    parser.add_argument("--temporal_positive_weight", type=float, default=0.0)
     parser.add_argument("--temporal_weight_horizon_hours", type=float, default=120.0)
-    parser.add_argument("--adaptive_negative_weight", type=float, default=1.0)
+    parser.add_argument("--adaptive_negative_weight", type=float, default=0.0)
     parser.add_argument("--adaptive_warmup_epochs", type=int, default=1)
     parser.add_argument("--val_fraction", type=float, default=0.2)
     parser.add_argument("--threshold_grid", default=DEFAULT_THRESHOLD_GRID)
@@ -1583,6 +2693,12 @@ def parse_args() -> argparse.Namespace:
         help=f"Optional DRAM-style lead-time sweep, e.g. '{DEFAULT_LEAD_TIME_GRID}'. Values accept m/min/h suffixes.",
     )
     parser.add_argument("--max_cached_files", type=int, default=128)
+    parser.add_argument(
+        "--module_cache_dir",
+        type=Path,
+        default=None,
+        help="Optional shared disk cache for unnormalized OFP feature arrays.",
+    )
     parser.add_argument("--max_train_files", type=int, default=2500)
     parser.add_argument("--max_test_files", type=int, default=1200)
     parser.add_argument("--seed", type=int, default=42)
@@ -1596,15 +2712,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_tf32", action="store_true")
     parser.add_argument("--seq_embedding_dim", type=int, default=256)
     parser.add_argument("--latent_dim", type=int, default=128)
+    parser.add_argument(
+        "--latent_probe_topk",
+        type=int,
+        default=0,
+        help=(
+            "When positive, fit one ExtraTrees selector on the concatenated pre-fusion temporal and "
+            "expert-statistical latents, train an additional decision model on the global Top-K, and "
+            "report it alongside the fused HTSF result."
+        ),
+    )
+    parser.add_argument("--latent_probe_estimators", type=int, default=300)
+    parser.add_argument("--latent_probe_max_rows", type=int, default=300000)
     parser.add_argument("--stat_hidden", type=int, default=256)
     parser.add_argument("--attn_heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--fusion_mode", choices=["gated_attn", "attn_mean"], default="gated_attn")
+    parser.add_argument("--fusion_mode", choices=list(FUSION_MODES), default="gated_attn")
     parser.add_argument(
         "--tsf_ablation",
         choices=["full", "no_stat_branch", "no_temporal_branch", "no_cross_attention"],
         default="full",
         help="TSF module ablation used for Table 5.",
+    )
+    parser.add_argument(
+        "--decision_layer",
+        choices=list(DECISION_LAYERS),
+        default="xgb",
+        help="Classifier applied to the learned HTSF representation.",
     )
     parser.add_argument("--xgb_balance_mode", choices=["auto", "sqrt", "none"], default="auto")
     parser.add_argument("--xgb_use_sample_weight", dest="xgb_use_sample_weight", action="store_true")
@@ -1626,10 +2760,9 @@ def main() -> None:
     global RUN_NAME
     args = parse_args()
     args.temporal_encoder = str(args.temporal_encoder).lower()
-    RUN_NAME = tsf_run_name(args.temporal_encoder)
+    args.decision_layer = str(args.decision_layer).lower()
+    RUN_NAME = tsf_run_name(args.temporal_encoder, args.decision_layer)
     if str(args.gpu_id).strip():
-        import os
-
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id).strip()
     results: list[dict[str, Any]] = []
     for fold in args.folds:

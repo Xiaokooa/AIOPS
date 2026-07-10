@@ -40,6 +40,12 @@ from OFP_DL_official.ofp_protocol.run_ofp_baselines import (
     first_event_valid_mask,
     make_model2_features,
 )
+from OFP.model2.ExperimentFeatureSchema import (
+    OFP_ENGINEERED_FEATURES,
+    RULE_FEATURES,
+    add_ofp_expert_stat_features,
+    deduplicate,
+)
 
 
 ModelBuilder = Callable[[int, int], tuple[nn.Module, dict, bool]]
@@ -51,6 +57,7 @@ BUILDERS: dict[str, ModelBuilder] = {
     "moderntcn": build_moderntcn,
     "fits": build_fits,
 }
+FEATURE_CACHE_VERSION = "ofp_feature_cache_v1"
 
 
 @dataclass
@@ -167,13 +174,20 @@ for _win in ROLL_WINDOWS:
         ]
     )
 COMPAT_PLUS_FEATURES = list(MODEL2_FEATURES) + LANE_PLUS_FEATURES + ROLLING_PLUS_FEATURES + DRAM_PLUS_FEATURES
+COMPAT_OFP_FEATURES = deduplicate([*MODEL2_FEATURES, *OFP_ENGINEERED_FEATURES])
+COMPAT_OFP_PLUS_FEATURES = deduplicate([*COMPAT_OFP_FEATURES, *LANE_PLUS_FEATURES, *ROLLING_PLUS_FEATURES, *DRAM_PLUS_FEATURES])
 
 
 def compat_feature_names(cfg: CompatCfg) -> list[str]:
-    if str(cfg.feature_mode).lower() in {"model2", "base"}:
+    mode = str(cfg.feature_mode).lower()
+    if mode in {"model2", "base"}:
         return list(MODEL2_FEATURES)
-    if str(cfg.feature_mode).lower() in {"model2_plus", "plus"}:
+    if mode in {"model2_plus", "plus"}:
         return list(COMPAT_PLUS_FEATURES)
+    if mode in {"ofp", "ofp_expert_stat"}:
+        return list(COMPAT_OFP_FEATURES)
+    if mode in {"ofp_plus", "ofp_expert_stat_plus"}:
+        return list(COMPAT_OFP_PLUS_FEATURES)
     raise ValueError(f"Unknown feature_mode={cfg.feature_mode!r}")
 
 
@@ -273,6 +287,12 @@ def _normal_rule_predict(frame: pd.DataFrame, rule_mode: str) -> np.ndarray:
     mode = str(rule_mode).lower()
     if mode in {"none", "off", "false", "0", "temp"} or len(frame) == 0:
         return np.zeros(len(frame), dtype=np.int8)
+    if mode == "ofp_rules":
+        available = [name for name in RULE_FEATURES if name in frame.columns]
+        if not available:
+            raise ValueError("rule_mode='ofp_rules' requires feature_mode='ofp' or 'ofp_plus'")
+        values = frame[available].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        return values.gt(0.0).any(axis=1).astype(np.int8).to_numpy()
     if mode != "model2_simple":
         raise ValueError(f"Unknown rule_mode={rule_mode!r}")
 
@@ -338,12 +358,103 @@ def _read_feature_parts(
 ) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     raw = pd.read_csv(data_dir / file_name)
     normal, extra = make_model2_features(raw, with_label=True)
-    if str(cfg.feature_mode).lower() in {"model2_plus", "plus"}:
+    feature_mode = str(cfg.feature_mode).lower()
+    if feature_mode in {"ofp", "ofp_expert_stat", "ofp_plus", "ofp_expert_stat_plus"}:
+        normal = add_ofp_expert_stat_features(normal)
+    if feature_mode in {"model2_plus", "plus", "ofp_plus", "ofp_expert_stat_plus"}:
         normal = add_model2_plus_features(normal)
     raw_idx = normal.index.to_numpy(dtype=int)
     valid_mask, labels, anomaly_labels = _make_targets(raw, normal, raw_idx, file_name, cfg, label_by_file)
     rule_pred = _normal_rule_predict(normal, cfg.rule_mode)
     return normal, extra, valid_mask.astype(bool), labels.astype(np.int8), anomaly_labels.astype(np.int8), rule_pred
+
+
+def _module_feature_cache_path(cfg: CompatCfg, file_name: str) -> Path | None:
+    if not str(cfg.module_cache_dir).strip():
+        return None
+    namespace = "__".join(
+        [
+            FEATURE_CACHE_VERSION,
+            str(cfg.feature_mode).lower(),
+            str(cfg.target_mode).lower(),
+            str(cfg.rule_mode).lower(),
+        ]
+    )
+    return Path(cfg.module_cache_dir) / namespace / f"{Path(file_name).stem}.npz"
+
+
+def _read_feature_arrays(
+    data_dir: Path,
+    file_name: str,
+    cfg: CompatCfg,
+    label_by_file: dict[str, int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    cache_path = _module_feature_cache_path(cfg, file_name)
+    if cache_path is not None and cache_path.exists():
+        try:
+            with np.load(cache_path, allow_pickle=False) as cached:
+                return (
+                    cached["timestamps"].astype(np.int64),
+                    cached["features"].astype(np.float32),
+                    cached["valid_mask"].astype(bool),
+                    cached["labels"].astype(np.int8),
+                    cached["anomaly_labels"].astype(np.int8),
+                    cached["rule_pred"].astype(np.int8),
+                    cached["extra"].astype(np.int64),
+                )
+        except (OSError, ValueError, KeyError):
+            cache_path.unlink(missing_ok=True)
+
+    normal, extra, valid_mask, labels, anomaly_labels, rule_pred = _read_feature_parts(
+        data_dir,
+        file_name,
+        cfg,
+        label_by_file,
+    )
+    timestamps = normal["Ts"].to_numpy(dtype=np.int64, copy=True) if len(normal) else np.zeros(0, dtype=np.int64)
+    features = _clean_features(normal.copy(), cfg)
+    extra_ts = extra["Ts"].to_numpy(dtype=np.int64, copy=True) if len(extra) else np.zeros(0, dtype=np.int64)
+    extra_temp = (
+        pd.to_numeric(extra["Temp"], errors="coerce").to_numpy(dtype=float)
+        if len(extra)
+        else np.zeros(0, dtype=float)
+    )
+    extra_pred = (extra_temp == TEMP_OUTLIER).astype(np.int8)
+    if str(cfg.rule_mode).lower() in {"none", "off", "false", "0"}:
+        extra_pred = np.zeros_like(extra_pred)
+    extra_array = (
+        np.stack([extra_ts, extra_pred], axis=1).astype(np.int64)
+        if len(extra_ts)
+        else np.zeros((0, 2), dtype=np.int64)
+    )
+    item = (
+        timestamps,
+        features.astype(np.float32),
+        valid_mask.astype(bool),
+        labels.astype(np.int8),
+        anomaly_labels.astype(np.int8),
+        rule_pred.astype(np.int8),
+        extra_array,
+    )
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+        try:
+            with temp_path.open("wb") as handle:
+                np.savez_compressed(
+                    handle,
+                    timestamps=item[0],
+                    features=item[1],
+                    valid_mask=item[2],
+                    labels=item[3],
+                    anomaly_labels=item[4],
+                    rule_pred=item[5],
+                    extra=item[6],
+                )
+            os.replace(temp_path, cache_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+    return item
 
 
 def compute_feature_norm_stats(
@@ -357,10 +468,15 @@ def compute_feature_norm_stats(
     sums_sq = np.zeros(len(feature_names), dtype=np.float64)
     count = 0
     for name in train_files:
-        normal, _extra, valid_mask, _labels, _anomaly_labels, _rule_pred = _read_feature_parts(data_dir, name, cfg, label_by_file)
-        if not len(normal) or not np.any(valid_mask):
+        _timestamps, features, valid_mask, _labels, _anomaly_labels, _rule_pred, _extra = _read_feature_arrays(
+            data_dir,
+            name,
+            cfg,
+            label_by_file,
+        )
+        if not len(features) or not np.any(valid_mask):
             continue
-        arr = _clean_features(normal.loc[valid_mask].copy(), cfg)
+        arr = features[valid_mask].astype(np.float32)
         sums += arr.sum(axis=0)
         sums_sq += (arr.astype(np.float64) ** 2).sum(axis=0)
         count += int(arr.shape[0])
@@ -390,19 +506,13 @@ class Model2FeatureCache:
             item = self.cache.pop(file_name)
             self.cache[file_name] = item
             return item
-        normal, extra, valid_mask, labels, anomaly_labels, rule_pred = _read_feature_parts(
-            self.data_dir, file_name, self.cfg, self.label_by_file
+        timestamps, features, valid_mask, labels, anomaly_labels, rule_pred, extra_array = _read_feature_arrays(
+            self.data_dir,
+            file_name,
+            self.cfg,
+            self.label_by_file,
         )
-        timestamps = normal["Ts"].to_numpy(dtype=np.int64, copy=True) if len(normal) else np.zeros(0, dtype=np.int64)
-        features = _clean_features(normal.copy(), self.cfg)
         features = ((features - self.mean) / self.std).astype(np.float32)
-        extra_ts = extra["Ts"].to_numpy(dtype=np.int64, copy=True) if len(extra) else np.zeros(0, dtype=np.int64)
-        extra_temp = (
-            pd.to_numeric(extra["Temp"], errors="coerce").to_numpy(dtype=float) if len(extra) else np.zeros(0, dtype=float)
-        )
-        extra_pred = (extra_temp == TEMP_OUTLIER).astype(np.int8)
-        if str(self.cfg.rule_mode).lower() in {"none", "off", "false", "0"}:
-            extra_pred = np.zeros_like(extra_pred)
         item = (
             timestamps,
             features,
@@ -410,7 +520,7 @@ class Model2FeatureCache:
             labels.astype(np.int8),
             anomaly_labels.astype(np.int8),
             rule_pred.astype(np.int8),
-            np.stack([extra_ts, extra_pred], axis=1) if len(extra_ts) else np.zeros((0, 2), dtype=np.int64),
+            extra_array.astype(np.int64),
         )
         self.cache[file_name] = item
         while len(self.cache) > int(self.cfg.max_cached_files):
@@ -1020,6 +1130,14 @@ def evaluate_prediction_frames(
         if not label_path.exists():
             continue
         true_label, true_ts = first_positive_timestamp(label_path, "anomaly")
+        candidate_timestamps = pd.to_numeric(
+            prediction_frames[name].get("timestamp", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        warnable_positive = 0
+        if true_label > 0 and true_ts is not None:
+            latest_legal_ts = float(true_ts) - float(min_hit_lead_hours) * 3600.0
+            warnable_positive = int(bool((candidate_timestamps.astype(float) < latest_legal_ts).any()))
         predict_label, predict_ts = _first_positive_timestamp_frame(
             prediction_frames[name],
             predict_column,
@@ -1046,6 +1164,8 @@ def evaluate_prediction_frames(
                 "valid_predict_positive": int(valid_predict_positive),
                 "hit": int(hit),
                 "lead_hour": lead_hour,
+                "warnable_positive": int(warnable_positive),
+                "non_warnable_positive": int(true_label > 0 and not warnable_positive),
                 "min_hit_lead_hours": float(min_hit_lead_hours),
             }
         )
@@ -1063,8 +1183,20 @@ def evaluate_prediction_frames(
     recall = tp / len(true_pos) if true_pos else 0.0
     f1 = 2.0 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
     accuracy = (tp + tn) / len(detail_df) if len(detail_df) else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    balanced_accuracy = 0.5 * (recall + specificity)
+    false_alarm_rate = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+    false_alarms_per_1000_normal = 1000.0 * false_alarm_rate
+    predicted_positive_rate = len(pred_pos) / len(detail_df) if len(detail_df) else 0.0
+    warnable_positive_cnt = int(detail_df["warnable_positive"].sum())
+    non_warnable_positive_cnt = int(detail_df["non_warnable_positive"].sum())
+    warnable_recall = tp / warnable_positive_cnt if warnable_positive_cnt > 0 else 0.0
+    first_warning_upper_bound = warnable_positive_cnt / len(true_pos) if true_pos else 0.0
     lead_hours = detail_df.loc[detail_df["hit"] > 0, "lead_hour"].dropna().astype(float)
     avg_lead_hour = float(lead_hours.mean()) if not lead_hours.empty else 0.0
+    median_lead_hour = float(lead_hours.median()) if not lead_hours.empty else 0.0
+    p25_lead_hour = float(lead_hours.quantile(0.25)) if not lead_hours.empty else 0.0
+    p75_lead_hour = float(lead_hours.quantile(0.75)) if not lead_hours.empty else 0.0
     min_lead_hour = float(lead_hours.min()) if not lead_hours.empty else 0.0
     avg_lead_score = math.tanh(avg_lead_hour)
     min_lead_score = math.tanh(min_lead_hour)
@@ -1085,6 +1217,19 @@ def evaluate_prediction_frames(
                 "min_lead_hour",
                 "lead_pread_cnt",
                 "accuracy",
+                "balanced_accuracy",
+                "specificity",
+                "false_alarm_rate",
+                "false_alarms_per_1000_normal",
+                "predicted_positive_rate",
+                "recall_all_positive",
+                "warnable_recall",
+                "warnable_positive_cnt",
+                "non_warnable_positive_cnt",
+                "first_warning_upper_bound",
+                "median_lead_hour",
+                "p25_lead_hour",
+                "p75_lead_hour",
                 "tp",
                 "fp",
                 "fn",
@@ -1106,6 +1251,19 @@ def evaluate_prediction_frames(
                 min_lead_hour,
                 int(detail_df["hit"].sum()),
                 accuracy,
+                balanced_accuracy,
+                specificity,
+                false_alarm_rate,
+                false_alarms_per_1000_normal,
+                predicted_positive_rate,
+                recall,
+                warnable_recall,
+                warnable_positive_cnt,
+                non_warnable_positive_cnt,
+                first_warning_upper_bound,
+                median_lead_hour,
+                p25_lead_hour,
+                p75_lead_hour,
                 tp,
                 fp,
                 fn,
@@ -1434,7 +1592,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pos_weight_cap", type=float, default=20.0)
     parser.add_argument("--fixed_threshold", type=float, default=0.5)
     parser.add_argument("--target_mode", choices=["ahead120", "anomaly", "module_fault"], default="module_fault")
-    parser.add_argument("--feature_mode", choices=["model2", "model2_plus"], default="model2_plus")
+    parser.add_argument(
+        "--feature_mode",
+        choices=["model2", "model2_plus", "ofp", "ofp_plus"],
+        default="model2_plus",
+    )
     parser.add_argument("--sampling_mode", choices=["row_ratio", "module_balanced"], default="module_balanced")
     parser.add_argument("--positive_windows_per_module", type=int, default=96)
     parser.add_argument("--negative_windows_per_faulty_module", type=int, default=24)
@@ -1442,7 +1604,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_fraction", type=float, default=0.2)
     parser.add_argument("--threshold_grid", default="0.001,0.003,0.005,0.01,0.02,0.03,0.05,0.07,0.10,0.15,0.20,0.25,0.30,0.40,0.50")
     parser.add_argument("--threshold_metric", default="f1_score")
-    parser.add_argument("--rule_mode", choices=["none", "temp", "model2_simple"], default="model2_simple")
+    parser.add_argument(
+        "--rule_mode",
+        choices=["none", "temp", "model2_simple", "ofp_rules"],
+        default="model2_simple",
+    )
     parser.add_argument("--sample_selection", choices=["random", "signal_topk", "hybrid"], default="random")
     parser.add_argument("--sample_topk_fraction", type=float, default=0.5)
     parser.add_argument("--temporal_positive_weight", type=float, default=0.0)
