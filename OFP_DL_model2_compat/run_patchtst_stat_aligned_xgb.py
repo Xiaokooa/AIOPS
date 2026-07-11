@@ -718,8 +718,6 @@ class TemporalStatAligner(nn.Module):
         stat_hidden: int = 256,
         attn_heads: int = 4,
         dropout: float = 0.2,
-        temporal_modality_dropout: float = 0.0,
-        stat_modality_dropout: float = 0.0,
         fusion_mode: str = "gated_attn",
         tsf_ablation: str = "full",
     ) -> None:
@@ -730,14 +728,6 @@ class TemporalStatAligner(nn.Module):
         self.requested_fusion_mode = str(fusion_mode)
         self.tsf_ablation = str(tsf_ablation)
         self.fusion_mode = resolve_fusion_mode(self.requested_fusion_mode, self.tsf_ablation)
-        self.temporal_modality_dropout = float(temporal_modality_dropout)
-        self.stat_modality_dropout = float(stat_modality_dropout)
-        for name, value in {
-            "temporal_modality_dropout": self.temporal_modality_dropout,
-            "stat_modality_dropout": self.stat_modality_dropout,
-        }.items():
-            if not 0.0 <= value < 1.0:
-                raise ValueError(f"{name} must be in [0, 1), got {value}")
         self.temporal_model, self.temporal_encoder_cfg, _ = BUILDERS[self.temporal_encoder](
             int(seq_len),
             int(n_raw_features),
@@ -782,17 +772,9 @@ class TemporalStatAligner(nn.Module):
             nn.Dropout(float(dropout)),
         )
         self.classifier = nn.Linear(int(latent_dim), 1)
-        self.temporal_classifier = nn.Linear(int(latent_dim), 1)
-        self.stat_classifier = nn.Linear(int(latent_dim), 1)
 
     def close(self) -> None:
         self.temporal_hook.close()
-
-    def _modality_dropout(self, latent: torch.Tensor, probability: float) -> torch.Tensor:
-        if not self.training or probability <= 0.0:
-            return latent
-        keep = (torch.rand((latent.shape[0], 1), device=latent.device) >= probability).to(latent.dtype)
-        return latent * keep / max(1.0 - probability, 1e-6)
 
     def encode(
         self,
@@ -800,7 +782,6 @@ class TemporalStatAligner(nn.Module):
         raw_mask: torch.Tensor,
         stat_x: torch.Tensor,
         return_explain: bool = False,
-        detach_explain: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         self.temporal_hook.clear()
         temporal_out = self.temporal_model(raw_x, raw_mask)
@@ -814,9 +795,7 @@ class TemporalStatAligner(nn.Module):
         seq_emb = self.seq_embedding(emb)
         seq_latent = self.seq_projection(seq_emb)
         stat_latent = self.stat_mlp(stat_x)
-        seq_fusion = self._modality_dropout(seq_latent, self.temporal_modality_dropout)
-        stat_fusion = self._modality_dropout(stat_latent, self.stat_modality_dropout)
-        tokens = torch.stack([seq_fusion, stat_fusion], dim=1)
+        tokens = torch.stack([seq_latent, stat_latent], dim=1)
         aligned = self.feature_alignment(tokens)
         if self.fusion_mode in {"temporal_only", "stat_only", "latent_concat"}:
             attended = aligned
@@ -835,61 +814,39 @@ class TemporalStatAligner(nn.Module):
                 average_attn_weights=False,
             )
         if self.fusion_mode == "temporal_only":
-            fused = self.single_view_fusion(seq_fusion)
+            fused = self.single_view_fusion(seq_latent)
             gate = torch.ones_like(seq_latent)
         elif self.fusion_mode == "stat_only":
-            fused = self.single_view_fusion(stat_fusion)
+            fused = self.single_view_fusion(stat_latent)
             gate = torch.zeros_like(seq_latent)
         elif self.fusion_mode == "latent_concat":
-            fused = self.fusion(torch.cat([seq_fusion, stat_fusion], dim=1))
+            fused = self.fusion(torch.cat([seq_latent, stat_latent], dim=1))
             gate = torch.full_like(seq_latent, 0.5)
         elif self.fusion_mode == "attn_mean":
             pooled = torch.cat([tokens.mean(dim=1), attended.mean(dim=1)], dim=1)
             gate = torch.full_like(seq_latent, 0.5)
             fused = self.fusion(pooled)
         elif self.fusion_mode == "gated_attn":
-            seq_context = 0.5 * (seq_fusion + attended[:, 0, :])
-            stat_context = 0.5 * (stat_fusion + attended[:, 1, :])
-            gate = self.modality_gate(torch.cat([seq_fusion, stat_fusion], dim=1))
+            seq_context = 0.5 * (seq_latent + attended[:, 0, :])
+            stat_context = 0.5 * (stat_latent + attended[:, 1, :])
+            gate = self.modality_gate(torch.cat([seq_latent, stat_latent], dim=1))
             gated = gate * seq_context + (1.0 - gate) * stat_context
             pooled = torch.cat([gated, attended.mean(dim=1)], dim=1)
             fused = self.fusion(pooled)
         else:
             raise ValueError(f"Unknown fusion_mode={self.fusion_mode!r}")
         if return_explain:
-            details = {
-                "attention": attn_weights,
-                "gate": gate,
-                "seq_latent": seq_latent,
-                "stat_latent": stat_latent,
+            return fused, {
+                "attention": attn_weights.detach(),
+                "gate": gate.detach(),
+                "seq_latent": seq_latent.detach(),
+                "stat_latent": stat_latent.detach(),
             }
-            if detach_explain:
-                details = {name: value.detach() for name, value in details.items()}
-            return fused, details
         return fused
 
     def forward(self, raw_x: torch.Tensor, raw_mask: torch.Tensor, stat_x: torch.Tensor) -> torch.Tensor:
         fused = self.encode(raw_x, raw_mask, stat_x)
         return self.classifier(fused).squeeze(-1)
-
-    def forward_with_aux(
-        self,
-        raw_x: torch.Tensor,
-        raw_mask: torch.Tensor,
-        stat_x: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        fused, details = self.encode(
-            raw_x,
-            raw_mask,
-            stat_x,
-            return_explain=True,
-            detach_explain=False,
-        )
-        return (
-            self.classifier(fused).squeeze(-1),
-            self.temporal_classifier(details["seq_latent"]).squeeze(-1),
-            self.stat_classifier(details["stat_latent"]).squeeze(-1),
-        )
 
 
 def initialize_lazy_layers(model: TemporalStatAligner, dataset: SelectedWindowStatDataset, cfg: CompatCfg) -> None:
@@ -1057,8 +1014,6 @@ def train_fusion_encoder(
         stat_hidden=args.stat_hidden,
         attn_heads=args.attn_heads,
         dropout=args.dropout,
-        temporal_modality_dropout=args.temporal_modality_dropout,
-        stat_modality_dropout=args.stat_modality_dropout,
         fusion_mode=args.fusion_mode,
         tsf_ablation=args.tsf_ablation,
     ).to(cfg.device)
@@ -1070,25 +1025,15 @@ def train_fusion_encoder(
         reduction="none",
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
-    warmup_epochs = max(0, min(int(args.branch_warmup_epochs), max(int(cfg.epochs) - 1, 0)))
-    temporal_aux_weight = max(0.0, float(args.temporal_aux_weight))
-    stat_aux_weight = max(0.0, float(args.stat_aux_weight))
-    use_aux = temporal_aux_weight > 0.0 or stat_aux_weight > 0.0 or warmup_epochs > 0
-    if warmup_epochs > 0 and temporal_aux_weight + stat_aux_weight <= 0.0:
-        raise ValueError("--branch_warmup_epochs requires a positive temporal or statistical auxiliary loss weight")
-    history: list[dict[str, Any]] = []
+    history: list[dict[str, float]] = []
     adaptive_meta: dict[str, float] = {}
     adaptive_applied = False
     train_started = time.time()
     for epoch in range(1, int(cfg.epochs) + 1):
         model.train()
         total_loss = 0.0
-        total_fused_loss = 0.0
-        total_temporal_loss = 0.0
-        total_stat_loss = 0.0
         n_seen = 0
         epoch_started = time.time()
-        phase = "branch-warmup" if epoch <= warmup_epochs else "fusion"
         for batch_idx, (raw_x, raw_m, stat_x, ys, ws) in enumerate(loader, 1):
             raw_x = raw_x.to(cfg.device)
             raw_m = raw_m.to(cfg.device)
@@ -1097,38 +1042,21 @@ def train_fusion_encoder(
             ws = ws.to(cfg.device).float()
             optimizer.zero_grad(set_to_none=True)
             with cuda_autocast(bool(cfg.amp) and str(cfg.device).startswith("cuda")):
-                if use_aux:
-                    logits, temporal_logits, stat_logits = model.forward_with_aux(raw_x, raw_m, stat_x)
-                    fused_loss = (loss_fn(logits, ys) * ws).sum() / torch.clamp(ws.sum(), min=1.0)
-                    temporal_loss = (loss_fn(temporal_logits, ys) * ws).sum() / torch.clamp(ws.sum(), min=1.0)
-                    stat_loss = (loss_fn(stat_logits, ys) * ws).sum() / torch.clamp(ws.sum(), min=1.0)
-                    loss = temporal_aux_weight * temporal_loss + stat_aux_weight * stat_loss
-                    if epoch > warmup_epochs:
-                        loss = loss + fused_loss
-                else:
-                    logits = model(raw_x, raw_m, stat_x)
-                    fused_loss = (loss_fn(logits, ys) * ws).sum() / torch.clamp(ws.sum(), min=1.0)
-                    temporal_loss = torch.zeros((), dtype=fused_loss.dtype, device=fused_loss.device)
-                    stat_loss = torch.zeros((), dtype=fused_loss.dtype, device=fused_loss.device)
-                    loss = fused_loss
+                logits = model(raw_x, raw_m, stat_x)
+                loss_raw = loss_fn(logits, ys)
+                loss = (loss_raw * ws).sum() / torch.clamp(ws.sum(), min=1.0)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), float(cfg.grad_clip))
             optimizer.step()
             batch_n = int(raw_x.shape[0])
             total_loss += float(loss.detach().cpu()) * batch_n
-            total_fused_loss += float(fused_loss.detach().cpu()) * batch_n
-            total_temporal_loss += float(temporal_loss.detach().cpu()) * batch_n
-            total_stat_loss += float(stat_loss.detach().cpu()) * batch_n
             n_seen += batch_n
             if int(cfg.log_batches) > 0 and batch_idx % int(cfg.log_batches) == 0:
                 elapsed = time.time() - epoch_started
                 print(
                     f"[batch] ep={epoch:02d} batch={batch_idx:>5}/{len(loader):<5} "
                     f"{progress_bar(batch_idx, len(loader), width=16)} "
-                    f"phase={phase} loss={total_loss / max(n_seen, 1):.5f} "
-                    f"fused={total_fused_loss / max(n_seen, 1):.5f} "
-                    f"temporal={total_temporal_loss / max(n_seen, 1):.5f} "
-                    f"stat={total_stat_loss / max(n_seen, 1):.5f} rows={n_seen} "
+                    f"loss={total_loss / max(n_seen, 1):.5f} rows={n_seen} "
                     f"rate={format_rate(n_seen, elapsed)} elapsed={format_duration(elapsed)}",
                     flush=True,
                 )
@@ -1136,18 +1064,7 @@ def train_fusion_encoder(
         elapsed_total = time.time() - train_started
         eta = (elapsed_total / max(epoch, 1)) * max(int(cfg.epochs) - epoch, 0)
         avg_loss = total_loss / max(n_seen, 1)
-        history.append(
-            {
-                "epoch": float(epoch),
-                "phase": phase,
-                "loss": float(avg_loss),
-                "fused_loss": float(total_fused_loss / max(n_seen, 1)),
-                "temporal_aux_loss": float(total_temporal_loss / max(n_seen, 1)),
-                "stat_aux_loss": float(total_stat_loss / max(n_seen, 1)),
-                "rows_seen": float(n_seen),
-                "elapsed_seconds": epoch_seconds,
-            }
-        )
+        history.append({"epoch": float(epoch), "loss": float(avg_loss), "rows_seen": float(n_seen), "elapsed_seconds": epoch_seconds})
         print(
             format_epoch_status(
                 "align-train",
@@ -1196,11 +1113,6 @@ def train_fusion_encoder(
         "train_pos_rows": int(base_dataset.pos_rows),
         "train_neg_rows": int(base_dataset.neg_rows),
         "pos_weight": float(pos_weight),
-        "branch_warmup_epochs": int(warmup_epochs),
-        "temporal_aux_weight": float(temporal_aux_weight),
-        "stat_aux_weight": float(stat_aux_weight),
-        "temporal_modality_dropout": float(args.temporal_modality_dropout),
-        "stat_modality_dropout": float(args.stat_modality_dropout),
         "history": history,
         "adaptive_negative_weight_meta": adaptive_meta,
         "temporal_feature_selection": temporal_selector_meta,
@@ -2178,8 +2090,6 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         rule_mode=args.rule_mode,
         sample_selection=args.sample_selection,
         sample_topk_fraction=args.sample_topk_fraction,
-        sample_signal_mode=args.sample_signal_mode,
-        sample_signal_temporal_fraction=args.sample_signal_temporal_fraction,
         temporal_positive_weight=args.temporal_positive_weight,
         temporal_weight_horizon_hours=args.temporal_weight_horizon_hours,
         adaptive_negative_weight=args.adaptive_negative_weight,
@@ -2229,13 +2139,6 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
             "latent probe top-k": int(args.latent_probe_topk) if int(args.latent_probe_topk) > 0 else "disabled",
             "rule mode": cfg.rule_mode,
             "sample selection": cfg.sample_selection,
-            "sample signal": cfg.sample_signal_mode,
-            "signal temporal mix": cfg.sample_signal_temporal_fraction,
-            "branch warmup": int(args.branch_warmup_epochs),
-            "aux loss weights": f"temporal={args.temporal_aux_weight} stat={args.stat_aux_weight}",
-            "modality dropout": (
-                f"temporal={args.temporal_modality_dropout} stat={args.stat_modality_dropout}"
-            ),
             "xgb balance": args.xgb_balance_mode,
             "xgb sample weight": bool(args.xgb_use_sample_weight),
             "seq_len": cfg.seq_len,
@@ -2453,13 +2356,6 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
                 "rule_mode": cfg.rule_mode,
                 "xgb_balance_mode": args.xgb_balance_mode,
                 "xgb_use_sample_weight": bool(args.xgb_use_sample_weight),
-                "sample_signal_mode": args.sample_signal_mode,
-                "sample_signal_temporal_fraction": float(args.sample_signal_temporal_fraction),
-                "branch_warmup_epochs": int(args.branch_warmup_epochs),
-                "temporal_aux_weight": float(args.temporal_aux_weight),
-                "stat_aux_weight": float(args.stat_aux_weight),
-                "temporal_modality_dropout": float(args.temporal_modality_dropout),
-                "stat_modality_dropout": float(args.stat_modality_dropout),
             },
         )
         append_lead_time_sweep_results(sweep_rows, Path(args.out_root))
@@ -2497,13 +2393,6 @@ def run_fold(fold: int, args: argparse.Namespace) -> list[dict[str, Any]]:
         "exclude_stat_feature_groups": args.exclude_stat_feature_groups,
         "sample_selection": args.sample_selection,
         "sample_topk_fraction": float(args.sample_topk_fraction),
-        "sample_signal_mode": args.sample_signal_mode,
-        "sample_signal_temporal_fraction": float(args.sample_signal_temporal_fraction),
-        "branch_warmup_epochs": int(args.branch_warmup_epochs),
-        "temporal_aux_weight": float(args.temporal_aux_weight),
-        "stat_aux_weight": float(args.stat_aux_weight),
-        "temporal_modality_dropout": float(args.temporal_modality_dropout),
-        "stat_modality_dropout": float(args.stat_modality_dropout),
         "temporal_positive_weight": float(args.temporal_positive_weight),
         "adaptive_negative_weight": float(args.adaptive_negative_weight),
         "train_rows": int(train_meta.get("train_rows", 0)),
@@ -2597,17 +2486,6 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
             "sampling_mode": args.sampling_mode,
             "sample_selection": item.get("sample_selection", args.sample_selection),
             "sample_topk_fraction": float(item.get("sample_topk_fraction", args.sample_topk_fraction)),
-            "sample_signal_mode": item.get("sample_signal_mode", args.sample_signal_mode),
-            "sample_signal_temporal_fraction": float(
-                item.get("sample_signal_temporal_fraction", args.sample_signal_temporal_fraction)
-            ),
-            "branch_warmup_epochs": int(item.get("branch_warmup_epochs", args.branch_warmup_epochs)),
-            "temporal_aux_weight": float(item.get("temporal_aux_weight", args.temporal_aux_weight)),
-            "stat_aux_weight": float(item.get("stat_aux_weight", args.stat_aux_weight)),
-            "temporal_modality_dropout": float(
-                item.get("temporal_modality_dropout", args.temporal_modality_dropout)
-            ),
-            "stat_modality_dropout": float(item.get("stat_modality_dropout", args.stat_modality_dropout)),
             "temporal_positive_weight": float(
                 item.get("temporal_positive_weight", args.temporal_positive_weight)
             ),
@@ -2661,13 +2539,6 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
             "sampling_mode",
             "sample_selection",
             "sample_topk_fraction",
-            "sample_signal_mode",
-            "sample_signal_temporal_fraction",
-            "branch_warmup_epochs",
-            "temporal_aux_weight",
-            "stat_aux_weight",
-            "temporal_modality_dropout",
-            "stat_modality_dropout",
             "temporal_positive_weight",
             "adaptive_negative_weight",
             "rule_mode",
@@ -2707,13 +2578,6 @@ def aggregate_results(results: list[dict[str, Any]], out_root: Path, args: argpa
         "sampling_mode",
         "sample_selection",
         "sample_topk_fraction",
-        "sample_signal_mode",
-        "sample_signal_temporal_fraction",
-        "branch_warmup_epochs",
-        "temporal_aux_weight",
-        "stat_aux_weight",
-        "temporal_modality_dropout",
-        "stat_modality_dropout",
         "temporal_positive_weight",
         "adaptive_negative_weight",
         "rule_mode",
@@ -2813,13 +2677,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sample_selection", choices=["random", "signal_topk", "hybrid"], default="hybrid")
     parser.add_argument("--sample_topk_fraction", type=float, default=0.5)
-    parser.add_argument(
-        "--sample_signal_mode",
-        choices=["expert", "temporal", "mixed"],
-        default="expert",
-        help="Signal used by signal_topk/hybrid sampling. Mixed rank-normalizes expert and raw temporal-change scores.",
-    )
-    parser.add_argument("--sample_signal_temporal_fraction", type=float, default=0.5)
     parser.add_argument("--temporal_positive_weight", type=float, default=0.0)
     parser.add_argument("--temporal_weight_horizon_hours", type=float, default=120.0)
     parser.add_argument("--adaptive_negative_weight", type=float, default=0.0)
@@ -2870,16 +2727,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stat_hidden", type=int, default=256)
     parser.add_argument("--attn_heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument(
-        "--branch_warmup_epochs",
-        type=int,
-        default=0,
-        help="Initial epochs trained only with branch auxiliary heads before enabling fused supervision.",
-    )
-    parser.add_argument("--temporal_aux_weight", type=float, default=0.0)
-    parser.add_argument("--stat_aux_weight", type=float, default=0.0)
-    parser.add_argument("--temporal_modality_dropout", type=float, default=0.0)
-    parser.add_argument("--stat_modality_dropout", type=float, default=0.0)
     parser.add_argument("--fusion_mode", choices=list(FUSION_MODES), default="gated_attn")
     parser.add_argument(
         "--tsf_ablation",

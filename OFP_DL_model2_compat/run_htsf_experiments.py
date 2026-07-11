@@ -109,36 +109,6 @@ def experiment_catalog() -> dict[str, list[ExperimentSpec]]:
         "sampling_mode": "module_balanced",
         "sample_selection": "hybrid",
         "sample_topk_fraction": 0.5,
-        "sample_signal_mode": "expert",
-        "sample_signal_temporal_fraction": 0.5,
-        "branch_warmup_epochs": 0,
-        "temporal_aux_weight": 0.0,
-        "stat_aux_weight": 0.0,
-        "temporal_modality_dropout": 0.0,
-        "stat_modality_dropout": 0.0,
-        "adaptive_negative_weight": 0.0,
-    }
-    branch_warmup = {
-        **full,
-        "branch_warmup_epochs": 2,
-        "temporal_aux_weight": 0.5,
-        "stat_aux_weight": 0.25,
-    }
-    modality_dropout = {
-        **branch_warmup,
-        "stat_modality_dropout": 0.25,
-    }
-    balanced_signal = {
-        **modality_dropout,
-        "sample_signal_mode": "mixed",
-        "sample_signal_temporal_fraction": 0.5,
-    }
-    hard_negative = {
-        **balanced_signal,
-        "adaptive_negative_weight": 1.0,
-        "adaptive_warmup_epochs": 3,
-        "no_xgb_sample_weight": False,
-        "xgb_use_sample_weight": True,
     }
     return {
         "main": [
@@ -156,13 +126,6 @@ def experiment_catalog() -> dict[str, list[ExperimentSpec]]:
             spec("fusion_expert_stat_only", "fusion", "Expert-statistical view only", "Tests engineered OFP evidence alone.", fusion_mode="stat_only", **{k: v for k, v in full.items() if k != "fusion_mode"}),
             spec("fusion_latent_concat", "fusion", "Latent concatenation", "Controls for gains from simple two-view concatenation.", fusion_mode="latent_concat", **{k: v for k, v in full.items() if k != "fusion_mode"}),
             spec("fusion_cross_attention", "fusion", "Cross attention", "Tests cross attention without learned modality gating.", fusion_mode="attn_mean", **{k: v for k, v in full.items() if k != "fusion_mode"}),
-        ],
-        "training": [
-            spec("training_baseline", "training", "HTSF training baseline", "Current end-to-end HTSF training control.", **full),
-            spec("training_branch_warmup", "training", "Branch warm-up", "Adds branch-specific auxiliary supervision before fused training.", **branch_warmup),
-            spec("training_modality_dropout", "training", "Warm-up + modality dropout", "Prevents immediate reliance on the expert-statistical branch.", **modality_dropout),
-            spec("training_balanced_signal", "training", "Balanced signal sampling", "Adds raw temporal-change evidence to hybrid sample selection.", **balanced_signal),
-            spec("training_hard_negative", "training", "Two-stage HTSF", "Adds adaptive hard-negative weighting to the complete training strategy.", **hard_negative),
         ],
         "sampling": [
             spec("sampling_row_random", "sampling", "Row-ratio random", "Controls for row-level sampling without trace balancing.", sampling_mode="row_ratio", sample_selection="random", fusion_mode="gated_attn", stat_feature_groups="statistical,expert"),
@@ -280,16 +243,8 @@ def build_command(
         "sampling_mode": "module_balanced",
         "sample_selection": "hybrid",
         "sample_topk_fraction": 0.5,
-        "sample_signal_mode": "expert",
-        "sample_signal_temporal_fraction": 0.5,
-        "branch_warmup_epochs": 0,
-        "temporal_aux_weight": 0.0,
-        "stat_aux_weight": 0.0,
-        "temporal_modality_dropout": 0.0,
-        "stat_modality_dropout": 0.0,
         "temporal_positive_weight": 0.0,
         "adaptive_negative_weight": 0.0,
-        "adaptive_warmup_epochs": 1,
         "rule_mode": "none",
         "positive_windows_per_module": args.positive_windows_per_module,
         "negative_windows_per_faulty_module": args.negative_windows_per_faulty_module,

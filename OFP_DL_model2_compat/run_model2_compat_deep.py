@@ -84,8 +84,6 @@ class CompatCfg:
     rule_mode: str = "model2_simple"
     sample_selection: str = "random"
     sample_topk_fraction: float = 0.5
-    sample_signal_mode: str = "expert"
-    sample_signal_temporal_fraction: float = 0.5
     temporal_positive_weight: float = 0.0
     temporal_weight_horizon_hours: float = 120.0
     adaptive_negative_weight: float = 0.0
@@ -530,56 +528,13 @@ class Model2FeatureCache:
         return item
 
 
-def _rank_normalize(values: np.ndarray) -> np.ndarray:
-    values = np.nan_to_num(np.asarray(values, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-    if len(values) <= 1:
-        return np.zeros(len(values), dtype=np.float32)
-    order = np.argsort(values, kind="stable")
-    ranks = np.empty(len(values), dtype=np.float32)
-    sorted_values = values[order]
-    start = 0
-    denominator = float(len(values) - 1)
-    while start < len(values):
-        end = start + 1
-        while end < len(values) and sorted_values[end] == sorted_values[start]:
-            end += 1
-        average_rank = 0.5 * float(start + end - 1) / denominator
-        ranks[order[start:end]] = average_rank
-        start = end
-    return ranks
-
-
-def row_signal_scores(
-    features: np.ndarray,
-    rule_pred: np.ndarray,
-    feature_names: list[str] | None = None,
-    mode: str = "expert",
-    temporal_fraction: float = 0.5,
-) -> np.ndarray:
+def row_signal_scores(features: np.ndarray, rule_pred: np.ndarray) -> np.ndarray:
     if len(features) == 0:
         return np.zeros(0, dtype=np.float32)
     finite = np.nan_to_num(features.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-    expert_score = np.mean(np.abs(finite), axis=1)
-    if len(rule_pred) == len(expert_score):
-        expert_score = expert_score + 5.0 * np.asarray(rule_pred, dtype=np.float32)
-
-    names = list(feature_names or [])
-    raw_indices = [names.index(name) for name in ROLLING_BASE_COLS[:12] if name in names]
-    temporal_score = np.zeros(len(finite), dtype=np.float32)
-    if raw_indices and len(finite) > 1:
-        raw = finite[:, raw_indices]
-        temporal_score[1:] = np.mean(np.abs(raw[1:] - raw[:-1]), axis=1)
-
-    resolved = str(mode).lower()
-    if resolved == "expert":
-        score = expert_score
-    elif resolved in {"temporal", "temporal_change"}:
-        score = temporal_score
-    elif resolved in {"mixed", "expert_temporal"}:
-        mix = float(np.clip(temporal_fraction, 0.0, 1.0))
-        score = (1.0 - mix) * _rank_normalize(expert_score) + mix * _rank_normalize(temporal_score)
-    else:
-        raise ValueError(f"Unknown sample_signal_mode={mode!r}; use expert, temporal, or mixed")
+    score = np.mean(np.abs(finite), axis=1)
+    if len(rule_pred) == len(score):
+        score = score + 5.0 * np.asarray(rule_pred, dtype=np.float32)
     return np.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
 
@@ -701,13 +656,7 @@ class CompatBatchedDataset(IterableDataset):
 
         for name, pos, neg, n_neg in zip(self.file_names, pos_positions, neg_positions, alloc):
             timestamps, features, _valid_mask, labels, anomaly_labels, rule_pred, _extra = self.cache.get(name)
-            signal_scores = row_signal_scores(
-                features,
-                rule_pred,
-                self.feature_names,
-                cfg.sample_signal_mode,
-                cfg.sample_signal_temporal_fraction,
-            )
+            signal_scores = row_signal_scores(features, rule_pred)
             if sampling_mode in {"module_balanced", "module"} and len(pos) > int(cfg.positive_windows_per_module) > 0:
                 stable = zlib.crc32((name + "::pos").encode("utf-8")) & 0xFFFFFFFF
                 pos = choose_positions_by_signal(
@@ -745,7 +694,6 @@ class CompatBatchedDataset(IterableDataset):
             f"sampling={cfg.sampling_mode} negative_ratio={cfg.negative_ratio} "
             f"per_module pos={cfg.positive_windows_per_module} faulty_neg={cfg.negative_windows_per_faulty_module} "
             f"normal_neg={cfg.normal_windows_per_module} selection={cfg.sample_selection} "
-            f"signal={cfg.sample_signal_mode} temporal_mix={cfg.sample_signal_temporal_fraction} "
             f"temporal_pos_w={cfg.temporal_positive_weight} features={len(self.feature_names)} batches={self.total_batches}"
         )
 
@@ -1189,10 +1137,7 @@ def evaluate_prediction_frames(
         warnable_positive = 0
         if true_label > 0 and true_ts is not None:
             latest_legal_ts = float(true_ts) - float(min_hit_lead_hours) * 3600.0
-            candidate_values = candidate_timestamps.astype(float)
-            warnable_positive = int(
-                bool(((candidate_values < float(true_ts)) & (candidate_values <= latest_legal_ts)).any())
-            )
+            warnable_positive = int(bool((candidate_timestamps.astype(float) < latest_legal_ts).any()))
         predict_label, predict_ts = _first_positive_timestamp_frame(
             prediction_frames[name],
             predict_column,
@@ -1666,8 +1611,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sample_selection", choices=["random", "signal_topk", "hybrid"], default="random")
     parser.add_argument("--sample_topk_fraction", type=float, default=0.5)
-    parser.add_argument("--sample_signal_mode", choices=["expert", "temporal", "mixed"], default="expert")
-    parser.add_argument("--sample_signal_temporal_fraction", type=float, default=0.5)
     parser.add_argument("--temporal_positive_weight", type=float, default=0.0)
     parser.add_argument("--temporal_weight_horizon_hours", type=float, default=120.0)
     parser.add_argument("--adaptive_negative_weight", type=float, default=0.0)
@@ -1718,8 +1661,6 @@ def main() -> None:
         rule_mode=args.rule_mode,
         sample_selection=args.sample_selection,
         sample_topk_fraction=args.sample_topk_fraction,
-        sample_signal_mode=args.sample_signal_mode,
-        sample_signal_temporal_fraction=args.sample_signal_temporal_fraction,
         temporal_positive_weight=args.temporal_positive_weight,
         temporal_weight_horizon_hours=args.temporal_weight_horizon_hours,
         adaptive_negative_weight=args.adaptive_negative_weight,
