@@ -21,7 +21,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from ofp_unified.features import (
+from .features import (
     MISSING_SENTINEL,
     RAW_FEATURES,
     TEMPERATURE_OUTLIER_SENTINEL,

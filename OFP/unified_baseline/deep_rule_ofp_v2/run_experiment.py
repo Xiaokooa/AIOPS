@@ -7,11 +7,9 @@ from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent
-UNIFIED_DIR = BASE_DIR.parent
 WORKSPACE_ROOT = BASE_DIR.parents[2]
-for search_path in (BASE_DIR, UNIFIED_DIR):
-    if str(search_path) not in sys.path:
-        sys.path.insert(0, str(search_path))
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
 from fgofp.config import load_config
 from fgofp.pipeline import run_experiment

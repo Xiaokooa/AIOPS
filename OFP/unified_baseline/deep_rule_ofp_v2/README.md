@@ -1,6 +1,6 @@
 # Deep Rule OFP v2：Native Seq2Seq + Future-Guided Learning
 
-本目录是一套面向光模块 **Failure Prediction（故障预测）** 的独立升级实现。它不会覆盖、迁移或静默改变旧版 [`../deep_rule_ofp`](../deep_rule_ofp)；旧版结果仍按旧版配置解释，新旧目录的模型、协议和产物不能混用。
+本目录是一套面向光模块 **Failure Prediction（故障预测）** 的独立升级实现。运行时只依赖本目录内的 `fgofp` 包，不依赖同级的 `ofp_unified` 或旧 baseline 源码。它不会覆盖、迁移或静默改变旧版 [`../deep_rule_ofp`](../deep_rule_ofp)；旧版结果仍按旧版配置解释，新旧目录的模型、协议和产物不能混用。
 
 当前 v2 刻意收紧研究范围，只回答一个问题：在 OFP 的模块级评价下，使用原生约 5 分钟观测序列的因果深度模型，能否从 Future-window CE 进一步受益于 Future-Guided Learning（FGL）。本版本只支持 `legacy_inclusive_v1`，不把规则分支、采样增强或模型融合悄悄加入主实验。
 
@@ -116,10 +116,23 @@ L = alpha * CE(student_logits(t), y120(t))
 
 在服务器的 AIOPS 根目录执行。以下命令使用本目录的命令行接口；可先运行 `--help` 查看最终可用参数。
 
-安装依赖：
+安装正式训练依赖（优先沿用服务器已有且与 CUDA 匹配的 PyTorch；不要无意中用 CPU wheel 覆盖它）：
 
 ```bash
-pip install -r OFP/unified_baseline/deep_rule_ofp_v2/requirements.txt
+python -m pip install -r OFP/unified_baseline/deep_rule_ofp_v2/requirements.txt
+```
+
+仅当需要运行测试时，再安装开发/测试依赖：
+
+```bash
+python -m pip install -r OFP/unified_baseline/deep_rule_ofp_v2/requirements-dev.txt
+```
+
+先做独立导入和 CUDA 环境预检：
+
+```bash
+python -B OFP/unified_baseline/deep_rule_ofp_v2/run_experiment.py --help
+python -c "import sys,numpy,pandas,torch; print(sys.executable); print(numpy.__version__,pandas.__version__,torch.__version__); print('cuda=',torch.cuda.is_available())"
 ```
 
 快速闭环验证：

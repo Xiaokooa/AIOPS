@@ -15,8 +15,6 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from ofp_unified.features import RAW_FEATURES
-
 from .config import FGOFPConfig
 from .data import (
     LengthBucketBatchSampler,
@@ -34,6 +32,7 @@ from .evaluation import (
     search_validation_threshold,
     write_module_predictions,
 )
+from .features import RAW_FEATURES
 from .model import CausalSeq2SeqTCN, build_teacher_student
 from .training import TrainingResult, resolve_device, seed_everything, train_models
 

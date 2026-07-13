@@ -19,7 +19,7 @@ from fgofp.data import (
     native_delta_steps,
     read_module_record,
 )
-from ofp_unified.features import RAW_FEATURES
+from fgofp.features import RAW_FEATURES
 
 
 def _frame(timestamps: list[float], anomaly: list[float], base: float = 1.0) -> pd.DataFrame:

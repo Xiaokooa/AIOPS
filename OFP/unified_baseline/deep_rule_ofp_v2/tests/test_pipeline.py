@@ -9,10 +9,10 @@ import torch
 
 from fgofp.config import FGOFPConfig
 from fgofp.data import ModuleRecord, NativeSequenceDataset, Standardizer
+from fgofp.features import RAW_FEATURES
 from fgofp.pipeline import infer_student, run_experiment
 from fgofp.model import build_teacher_student
 from fgofp.training import seed_everything
-from ofp_unified.features import RAW_FEATURES
 
 
 class FixedStudent(torch.nn.Module):
