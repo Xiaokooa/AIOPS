@@ -788,6 +788,10 @@ def run_experiment(
             if training.teacher_train_only is not None
             else 0
         ),
+        "fgl_alpha": float(config.training.fgl_alpha),
+        "positive_weight_mode": config.training.positive_weight_mode,
+        "student_positive_weight": float(training.student_positive_weight),
+        "teacher_positive_weight": float(training.teacher_positive_weight),
         "student_ce_rows": int(training.coverage.get("student_ce_rows", 0)),
         "student_ce_positive_rows": int(
             training.coverage.get("student_ce_positive_rows", 0)
@@ -948,6 +952,7 @@ def run_experiment(
                 else "future_window_cross_entropy_plus_fgl_kl"
             ),
             "fgl_alpha": config.training.fgl_alpha,
+            "positive_weight_mode": config.training.positive_weight_mode,
             "temperature": config.training.temperature,
             "fgl_coverage_scale": training.fgl_coverage_scale,
             "student_positive_weight": training.student_positive_weight,

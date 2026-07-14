@@ -97,7 +97,14 @@ def test_legacy_inclusive_full_module_outcomes_and_score() -> None:
     expected_avg = expected_lead_sum / 4.0
     assert metrics["lead_sum_hour"] == pytest.approx(expected_lead_sum)
     assert metrics["avg_lead_hour"] == pytest.approx(expected_avg)
+    assert metrics["mean_lead_hour_among_hits"] == pytest.approx(
+        expected_lead_sum / 2.0
+    )
     assert metrics["min_lead_hour"] == 0.0
+    assert metrics["strict_early_hit_count"] == 1
+    assert metrics["strict_early_recall"] == pytest.approx(0.25)
+    assert metrics["early_hit_count_at_6h"] == 0
+    assert metrics["early_hit_rate_at_6h"] == 0.0
     expected_final = metrics["f1_score"] + metrics["accuracy"] + math.tanh(
         expected_avg
     )
@@ -133,7 +140,12 @@ def test_original_ofp_strict_requires_alarm_before_failure_timestamp() -> None:
     expected_avg = expected_lead_sum / 4.0
     assert metrics["lead_sum_hour"] == pytest.approx(expected_lead_sum)
     assert metrics["avg_lead_hour"] == pytest.approx(expected_avg)
+    assert metrics["mean_lead_hour_among_hits"] == pytest.approx(
+        expected_lead_sum
+    )
     assert metrics["min_lead_hour"] == pytest.approx(expected_lead_sum)
+    assert metrics["strict_early_hit_count"] == 1
+    assert metrics["strict_early_recall"] == pytest.approx(0.25)
     expected_final = (
         metrics["f1_score"]
         + metrics["accuracy"]
@@ -196,6 +208,28 @@ def test_pooled_metrics_are_recomputed_from_concatenated_strict_decisions() -> N
     )
     assert pooled["f1_score"] != pytest.approx(fold_mean_f1)
     assert pooled["module_count"] == 6
+
+
+def test_early_warning_rates_use_all_faulty_modules_and_include_boundaries() -> None:
+    detail = pd.DataFrame(
+        {
+            "outcome": ["TP", "TP", "TP", "TP", "TP", "FN"],
+            "lead_hour": [0.0, 6.0, 12.0, 24.0, 72.0, np.nan],
+            "alarm_at_failure": [1, 0, 0, 0, 0, 0],
+            "postfault_only_alarm": [0, 0, 0, 0, 0, 0],
+        }
+    )
+
+    metrics = metrics_from_module_decisions(detail, protocol=PROTOCOL_NAME)
+
+    assert metrics["mean_lead_hour_among_hits"] == pytest.approx(114.0 / 5.0)
+    assert metrics["strict_early_hit_count"] == 4
+    assert metrics["strict_early_recall"] == pytest.approx(4.0 / 6.0)
+    for horizon, expected_count in ((6, 4), (12, 3), (24, 2), (72, 1)):
+        assert metrics[f"early_hit_count_at_{horizon}h"] == expected_count
+        assert metrics[f"early_hit_rate_at_{horizon}h"] == pytest.approx(
+            expected_count / 6.0
+        )
 
 
 def test_pooled_metric_input_rejects_protocol_inconsistent_decisions() -> None:

@@ -25,6 +25,7 @@ OFP_ORIGINAL_PROTOCOL_NAME = "ofp_original_strict_v1"
 _SUPPORTED_PROTOCOLS = frozenset((PROTOCOL_NAME, OFP_ORIGINAL_PROTOCOL_NAME))
 _TIMESTAMP_SECONDS = "__fgofp_timestamp_seconds"
 _ANOMALY = "__fgofp_anomaly"
+EARLY_WARNING_HORIZONS_HOUR = (6, 12, 24, 72)
 
 
 @dataclass(frozen=True)
@@ -149,7 +150,19 @@ def metrics_from_module_decisions(
     accuracy = _safe_ratio(tp + tn, module_count)
     lead_sum_hour = float(hit_leads.sum()) if tp else 0.0
     avg_lead_hour = _safe_ratio(lead_sum_hour, faulty_count)
+    mean_lead_hour_among_hits = _safe_ratio(lead_sum_hour, tp)
     min_lead_hour = float(hit_leads.min()) if tp else 0.0
+    strict_early_hit_count = int((hit_leads > 0.0).sum())
+    strict_early_recall = _safe_ratio(strict_early_hit_count, faulty_count)
+    early_warning_metrics: dict[str, Any] = {}
+    for horizon_hour in EARLY_WARNING_HORIZONS_HOUR:
+        early_hit_count = int((hit_leads >= float(horizon_hour)).sum())
+        early_warning_metrics[f"early_hit_count_at_{horizon_hour}h"] = (
+            early_hit_count
+        )
+        early_warning_metrics[f"early_hit_rate_at_{horizon_hour}h"] = _safe_ratio(
+            early_hit_count, faulty_count
+        )
     avg_lead_score = math.tanh(avg_lead_hour)
     min_lead_score = math.tanh(min_lead_hour)
     final_score = f1_score + accuracy + avg_lead_score + min_lead_score
@@ -162,7 +175,11 @@ def metrics_from_module_decisions(
         "recall": float(recall),
         "accuracy": float(accuracy),
         "avg_lead_hour": float(avg_lead_hour),
+        "mean_lead_hour_among_hits": float(mean_lead_hour_among_hits),
         "min_lead_hour": float(min_lead_hour),
+        "strict_early_hit_count": strict_early_hit_count,
+        "strict_early_recall": float(strict_early_recall),
+        **early_warning_metrics,
         "avg_lead_score": float(avg_lead_score),
         "min_lead_score": float(min_lead_score),
         "lead_sum_hour": float(lead_sum_hour),
@@ -955,6 +972,7 @@ write_ofp_module_csvs = write_module_predictions
 
 
 __all__ = [
+    "EARLY_WARNING_HORIZONS_HOUR",
     "OFP_ORIGINAL_PROTOCOL_NAME",
     "PROTOCOL_NAME",
     "LegacyEvaluationResult",

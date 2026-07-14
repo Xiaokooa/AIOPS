@@ -37,6 +37,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-fold", type=int, choices=(1, 2, 3), default=None)
     parser.add_argument("--fgl-alpha", type=float, default=None)
     parser.add_argument(
+        "--positive-weight-mode",
+        choices=("module_normalized_auto", "none"),
+        default=None,
+    )
+    parser.add_argument(
         "--architecture",
         choices=("causal_depthwise_tcn", "rule_guided_residual_tcn"),
         default=None,
@@ -73,6 +78,10 @@ def _overrides(args: argparse.Namespace) -> dict:
         overrides.setdefault("split", {})["test_fold"] = int(args.test_fold)
     if args.fgl_alpha is not None:
         overrides.setdefault("training", {})["fgl_alpha"] = float(args.fgl_alpha)
+    if args.positive_weight_mode is not None:
+        overrides.setdefault("training", {})["positive_weight_mode"] = str(
+            args.positive_weight_mode
+        )
     if args.architecture is not None:
         overrides.setdefault("model", {})["architecture"] = str(args.architecture)
     if args.rule_residual_scale is not None:

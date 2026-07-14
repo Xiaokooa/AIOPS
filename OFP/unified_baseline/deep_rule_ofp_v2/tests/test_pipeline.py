@@ -178,6 +178,12 @@ def test_tiny_end_to_end_writes_student_only_deployment_checkpoint(
     assert (output / "test_rule_only_module_decisions.csv").is_file()
     result = pd.read_csv(output / "result.csv").iloc[0]
     assert result["protocol"] == "legacy_inclusive_v1"
+    assert result["fgl_alpha"] == pytest.approx(1.0)
+    assert result["positive_weight_mode"] == "none"
+    assert result["student_positive_weight"] == pytest.approx(1.0)
+    assert result["teacher_positive_weight"] == pytest.approx(1.0)
+    assert "strict_early_recall" in result.index
+    assert "early_hit_rate_at_24h" in result.index
     validation_selection = pd.read_csv(
         output / "validation_decision_selection.csv"
     )
@@ -247,4 +253,5 @@ def test_tiny_end_to_end_writes_student_only_deployment_checkpoint(
         assert prediction["predict"].astype(np.int8).equals(expected_predict)
     persisted = json.loads((output / "run_manifest.json").read_text(encoding="utf-8"))
     assert persisted["task"]["student_horizon_hours"] == 120.0
+    assert persisted["training"]["positive_weight_mode"] == "none"
     assert persisted["ofp_original_compatibility"]["lead_denominator"] == "all_faulty_modules"

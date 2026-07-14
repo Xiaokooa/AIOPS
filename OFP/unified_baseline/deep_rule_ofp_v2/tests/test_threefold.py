@@ -77,6 +77,10 @@ def _write_fold_artifacts(root: Path, fold: int, threshold: float) -> tuple[pd.D
         "decision_feature_count": 25,
         "student_parameters": 100,
         "teacher_training_parameters": 100,
+        "fgl_alpha": 0.5,
+        "positive_weight_mode": "module_normalized_auto",
+        "student_positive_weight": 2.0 + fold,
+        "teacher_positive_weight": 3.0 + fold,
         "seconds_total": float(fold),
     }
     pd.DataFrame(
@@ -105,6 +109,10 @@ def _write_fold_artifacts(root: Path, fold: int, threshold: float) -> tuple[pd.D
                 "experiment_name": f"N1_fold{fold}",
                 "split": {"test_fold": fold, "seed": 42},
                 "model": {"architecture": "unit"},
+                "training": {
+                    "fgl_alpha": 0.5,
+                    "positive_weight_mode": "module_normalized_auto",
+                },
             }
         ),
         encoding="utf-8",
@@ -172,6 +180,16 @@ def test_threefold_aggregation_recomputes_exact_pooled_metrics(tmp_path: Path) -
             expected_original[name]
         )
     assert comparison.loc[PROTOCOL_NAME, "module_count"] == 6
+    assert comparison.loc[PROTOCOL_NAME, "variant"] == (
+        "native_s2s_ce_fgl_3fold_pooled"
+    )
+    assert comparison.loc[PROTOCOL_NAME, "fgl_alpha"] == pytest.approx(0.5)
+    assert comparison.loc[PROTOCOL_NAME, "positive_weight_mode"] == (
+        "module_normalized_auto"
+    )
+    assert comparison.loc[PROTOCOL_NAME, "fold_2_student_positive_weight"] == (
+        pytest.approx(4.0)
+    )
     assert comparison.loc[PROTOCOL_NAME, "threshold_policy"] == "per_fold_validation_selected"
     assert comparison.loc[OFP_ORIGINAL_PROTOCOL_NAME, "decision_threshold"] == 0.5
     assert (tmp_path / "pooled" / "test_module_decisions_legacy_inclusive.csv").is_file()
@@ -346,6 +364,83 @@ def test_fold_command_is_n1_and_targets_one_outer_fold(tmp_path: Path) -> None:
     assert str(tmp_path / "out" / "fold_2") in command
     assert "--disable-fgl" not in command
     assert "--smoke" not in command
+
+
+def test_fold_command_forwards_objective_and_lead_audit_options(
+    tmp_path: Path,
+) -> None:
+    args = argparse.Namespace(
+        output_dir=tmp_path / "out",
+        config=tmp_path / "config.json",
+        data_dir=tmp_path / "training",
+        index_path=tmp_path / "index.csv",
+        device="cuda",
+        experiment_name="ablation",
+        batch_size=None,
+        inference_batch_size=None,
+        fgl_alpha=0.75,
+        disable_fgl=True,
+        positive_weight_mode="none",
+        future_offset_hours=12.0,
+        alignment_tolerance_seconds=90,
+        no_mixed_precision=False,
+        smoke=False,
+        save_long_scores=True,
+        overwrite=False,
+    )
+
+    command = build_fold_command(args, 1)
+
+    assert command[command.index("--fgl-alpha") + 1] == "0.75"
+    assert "--disable-fgl" in command
+    assert command[command.index("--positive-weight-mode") + 1] == "none"
+    assert command[command.index("--future-offset-hours") + 1] == "12.0"
+    assert command[command.index("--alignment-tolerance-seconds") + 1] == "90"
+    assert "--save-long-scores" in command
+
+
+def test_threefold_audits_new_lead_metrics_when_present(tmp_path: Path) -> None:
+    index_path = _write_complete_fixture(tmp_path)
+    result_path = tmp_path / "fold_1" / "result.csv"
+    result = pd.read_csv(result_path)
+    result.loc[0, "strict_early_recall"] = (
+        float(result.loc[0, "strict_early_recall"]) + 0.1
+    )
+    result.to_csv(result_path, index=False)
+
+    with pytest.raises(ValueError, match="strict_early_recall"):
+        aggregate_three_fold_results(tmp_path, index_path, formal=False)
+
+
+def test_threefold_accepts_legacy_results_without_new_lead_metrics(
+    tmp_path: Path,
+) -> None:
+    index_path = _write_complete_fixture(tmp_path)
+    optional = {
+        "mean_lead_hour_among_hits",
+        "strict_early_hit_count",
+        "strict_early_recall",
+        "early_hit_count_at_6h",
+        "early_hit_rate_at_6h",
+        "early_hit_count_at_12h",
+        "early_hit_rate_at_12h",
+        "early_hit_count_at_24h",
+        "early_hit_rate_at_24h",
+        "early_hit_count_at_72h",
+        "early_hit_rate_at_72h",
+    }
+    for fold in (1, 2, 3):
+        for result_name in ("result.csv", "result_ofp_original.csv"):
+            path = tmp_path / f"fold_{fold}" / result_name
+            result = pd.read_csv(path)
+            result = result.drop(columns=sorted(optional & set(result.columns)))
+            result.to_csv(path, index=False)
+
+    comparison = aggregate_three_fold_results(
+        tmp_path, index_path, experiment_id="legacy", formal=False
+    )
+
+    assert "strict_early_recall" in comparison.columns
 
 
 @pytest.mark.parametrize(

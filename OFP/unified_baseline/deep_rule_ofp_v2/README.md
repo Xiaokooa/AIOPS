@@ -237,3 +237,5 @@ N0 与 N1 必须共享数据划分、标准化、TCN 架构、student epoch、�
 添加 `--save-long-scores` 时，还会保存压缩的 `validation_scores.csv.gz` 和 `test_scores.csv.gz`。suite 汇总表应以 `comparison.csv` 为入口，直接比较 N0 与 N1。
 
 更严格的标签、泄漏边界与模块级计分定义见 [PROTOCOL.md](PROTOCOL.md)。
+
+紧凑的 FORT 模块消融及一键运行入口见 [MODULE_ABLATION.md](MODULE_ABLATION.md)。

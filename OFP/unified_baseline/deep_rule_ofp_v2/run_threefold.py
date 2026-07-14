@@ -39,6 +39,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--inference-batch-size", type=int, default=None)
+    parser.add_argument("--fgl-alpha", type=float, default=None)
+    parser.add_argument(
+        "--disable-fgl",
+        "--disable-pkd",
+        dest="disable_fgl",
+        action="store_true",
+        help="Disable prospective knowledge distillation (legacy name: FGL).",
+    )
+    parser.add_argument(
+        "--positive-weight-mode",
+        choices=("module_normalized_auto", "none"),
+        default=None,
+    )
+    parser.add_argument("--future-offset-hours", type=float, default=None)
+    parser.add_argument("--alignment-tolerance-seconds", type=int, default=None)
     parser.add_argument(
         "--architecture",
         choices=("causal_depthwise_tcn", "rule_guided_residual_tcn"),
@@ -53,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-mixed-precision", action="store_true")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--save-long-scores", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -82,6 +98,23 @@ def build_fold_command(args: argparse.Namespace, fold: int) -> list[str]:
         command.extend(("--batch-size", str(args.batch_size)))
     if args.inference_batch_size is not None:
         command.extend(("--inference-batch-size", str(args.inference_batch_size)))
+    if getattr(args, "fgl_alpha", None) is not None:
+        command.extend(("--fgl-alpha", str(args.fgl_alpha)))
+    if bool(getattr(args, "disable_fgl", False)):
+        command.append("--disable-fgl")
+    if getattr(args, "positive_weight_mode", None) is not None:
+        command.extend(
+            ("--positive-weight-mode", str(args.positive_weight_mode))
+        )
+    if getattr(args, "future_offset_hours", None) is not None:
+        command.extend(("--future-offset-hours", str(args.future_offset_hours)))
+    if getattr(args, "alignment_tolerance_seconds", None) is not None:
+        command.extend(
+            (
+                "--alignment-tolerance-seconds",
+                str(args.alignment_tolerance_seconds),
+            )
+        )
     if getattr(args, "architecture", None) is not None:
         command.extend(("--architecture", str(args.architecture)))
     if getattr(args, "fallback_min_gain", None) is not None:
@@ -94,6 +127,8 @@ def build_fold_command(args: argparse.Namespace, fold: int) -> list[str]:
         command.append("--no-mixed-precision")
     if args.smoke:
         command.append("--smoke")
+    if bool(getattr(args, "save_long_scores", False)):
+        command.append("--save-long-scores")
     if args.overwrite:
         command.append("--overwrite")
     return command
@@ -101,6 +136,10 @@ def build_fold_command(args: argparse.Namespace, fold: int) -> list[str]:
 
 def main() -> None:
     args = parse_args()
+    args.config = args.config.resolve()
+    args.data_dir = args.data_dir.resolve()
+    args.index_path = args.index_path.resolve()
+    args.output_dir = args.output_dir.resolve()
     if args.output_dir.exists() and any(args.output_dir.iterdir()) and not args.overwrite:
         raise FileExistsError(
             f"output directory is not empty: {args.output_dir}; pass --overwrite"

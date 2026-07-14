@@ -56,6 +56,25 @@ _AUDITED_METRICS = (
     "at_failure_hit_count",
     "postfault_only_alarm_count",
 )
+_OPTIONAL_AUDITED_METRICS = (
+    "mean_lead_hour_among_hits",
+    "strict_early_hit_count",
+    "strict_early_recall",
+    "early_hit_count_at_6h",
+    "early_hit_rate_at_6h",
+    "early_hit_count_at_12h",
+    "early_hit_rate_at_12h",
+    "early_hit_count_at_24h",
+    "early_hit_rate_at_24h",
+    "early_hit_count_at_72h",
+    "early_hit_rate_at_72h",
+)
+_TRAINING_AUDIT_FIELDS = (
+    "fgl_alpha",
+    "positive_weight_mode",
+    "student_positive_weight",
+    "teacher_positive_weight",
+)
 
 
 def _one_row(path: Path) -> dict[str, Any]:
@@ -197,6 +216,67 @@ def _validate_result_metrics(
                 f"result/detail metric mismatch in {source}: "
                 f"{name}={actual!r}, recomputed={expected!r}"
             )
+    # These lead-time diagnostics were added after the first formal runs.  Old
+    # artifacts remain poolable, but any diagnostic present in a fold result
+    # must exactly agree with its auditable module-decision table.
+    for name in _OPTIONAL_AUDITED_METRICS:
+        if name not in result:
+            continue
+        expected = float(recomputed[name])
+        actual = float(result[name])
+        if not np.isfinite(actual) or not np.isclose(
+            actual,
+            expected,
+            rtol=1e-10,
+            atol=1e-12,
+        ):
+            raise ValueError(
+                f"result/detail metric mismatch in {source}: "
+                f"{name}={actual!r}, recomputed={expected!r}"
+            )
+
+
+def _validate_training_metadata(
+    result: Mapping[str, Any],
+    config: Mapping[str, Any],
+    *,
+    source: Path,
+) -> None:
+    """Audit new loss/class-weight metadata while accepting old artifacts."""
+
+    present = [name for name in _TRAINING_AUDIT_FIELDS if name in result]
+    if not present:
+        return
+    missing = [name for name in _TRAINING_AUDIT_FIELDS if name not in result]
+    if missing:
+        raise ValueError(f"training audit fields missing in {source}: {missing}")
+
+    fgl_alpha = float(result["fgl_alpha"])
+    if not np.isfinite(fgl_alpha) or not 0.0 <= fgl_alpha <= 1.0:
+        raise ValueError(f"invalid fgl_alpha in {source}")
+    mode = str(result["positive_weight_mode"])
+    if mode not in {"none", "module_normalized_auto"}:
+        raise ValueError(f"invalid positive_weight_mode in {source}")
+    for name in ("student_positive_weight", "teacher_positive_weight"):
+        value = float(result[name])
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"invalid {name} in {source}")
+        if mode == "none" and not np.isclose(value, 1.0, rtol=0.0, atol=1e-12):
+            raise ValueError(f"{name} must be 1 when class weighting is disabled")
+
+    training_config = config.get("training", {})
+    if "fgl_alpha" in training_config and not np.isclose(
+        fgl_alpha,
+        float(training_config["fgl_alpha"]),
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise ValueError(f"result/config fgl_alpha mismatch in {source}")
+    if (
+        "positive_weight_mode" in training_config
+        and mode != str(training_config["positive_weight_mode"])
+    ):
+        raise ValueError(f"result/config positive_weight_mode mismatch in {source}")
 
 
 def _validate_detail_names(
@@ -259,8 +339,12 @@ def _common_result_fields(fold_results: pd.DataFrame) -> dict[str, Any]:
         "sequence_to_sequence",
         "teacher_used_at_inference",
         "decision_feature_count",
+        "rule_candidate_feature_count",
+        "model_architecture",
         "student_parameters",
         "teacher_training_parameters",
+        "fgl_alpha",
+        "positive_weight_mode",
     )
     common: dict[str, Any] = {}
     for name in fields:
@@ -271,6 +355,21 @@ def _common_result_fields(fold_results: pd.DataFrame) -> dict[str, Any]:
             raise ValueError(f"fold results disagree on {name}")
         common[name] = values.iloc[0]
     return common
+
+
+def _fold_training_weight_fields(fold_results: pd.DataFrame) -> dict[str, Any]:
+    """Preserve data-dependent class weights without treating them as constants."""
+
+    fields: dict[str, Any] = {}
+    for name in ("student_positive_weight", "teacher_positive_weight"):
+        if name not in fold_results:
+            continue
+        for row in fold_results.itertuples(index=False):
+            value = float(getattr(row, name))
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"invalid fold-specific {name}")
+            fields[f"fold_{int(row.outer_fold)}_{name}"] = value
+    return fields
 
 
 def _comparison_row(
@@ -301,9 +400,11 @@ def _comparison_row(
         if has_declared_sources
         else {fold: "rule_guided_residual" for fold in OUTER_FOLDS}
     )
+    common_fields = _common_result_fields(fold_results)
+    fold_variant = str(common_fields.pop("variant", experiment_id))
     row: dict[str, Any] = {
         "experiment_id": experiment_id,
-        "variant": "native_s2s_ce_fgl_3fold_pooled",
+        "variant": f"{fold_variant}_3fold_pooled",
         "changed_axis": "evaluation_protocol",
         "training_protocol": PROTOCOL_NAME,
         "evaluation_protocol": protocol,
@@ -329,7 +430,8 @@ def _comparison_row(
         "seconds_total": float(
             pd.to_numeric(fold_results["seconds_total"], errors="raise").sum()
         ),
-        **_common_result_fields(fold_results),
+        **common_fields,
+        **_fold_training_weight_fields(fold_results),
         **dict(metrics),
     }
     return row
@@ -383,6 +485,7 @@ def aggregate_three_fold_results(
 
         result_path = fold_dir / "result.csv"
         result = _one_row(result_path)
+        _validate_training_metadata(result, fold_config, source=result_path)
         _validate_decision_source_architecture(
             result, fold_config, source=result_path
         )
