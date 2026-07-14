@@ -128,6 +128,11 @@ def test_tiny_end_to_end_writes_student_only_deployment_checkpoint(
     stale_checkpoints = output / "checkpoints"
     stale_checkpoints.mkdir(parents=True)
     (stale_checkpoints / "teacher_train_only.pt").write_bytes(b"stale")
+    stale_original_predictions = output / "ofp_predictions_original_fixed_0.5"
+    stale_original_predictions.mkdir(parents=True)
+    (stale_original_predictions / "stale.csv").write_text(
+        "timestamp,score,predict\n0,1,1\n", encoding="utf-8"
+    )
     manifest = run_experiment(
         config,
         data_dir,
@@ -153,11 +158,25 @@ def test_tiny_end_to_end_writes_student_only_deployment_checkpoint(
     ].index("test_csv")
     assert manifest["deployment"]["teacher_used_at_inference"] is False
     assert pd.read_csv(output / "result.csv").loc[0, "protocol"] == "legacy_inclusive_v1"
+    original_result = pd.read_csv(output / "result_ofp_original.csv").iloc[0]
+    assert original_result["protocol"] == "ofp_original_strict_v1"
+    assert original_result["decision_threshold"] == 0.5
+    assert (output / "test_module_decisions_ofp_original.csv").is_file()
     expected_test_files = {
         row["file_name"] for row in rows if row["folder_index"] == 3
     }
     assert {
         path.name for path in (output / "ofp_predictions").glob("*.csv")
     } == expected_test_files
+    original_prediction_dir = output / "ofp_predictions_original_fixed_0.5"
+    assert {
+        path.name for path in original_prediction_dir.glob("*.csv")
+    } == expected_test_files
+    assert not (original_prediction_dir / "stale.csv").exists()
+    for path in original_prediction_dir.glob("*.csv"):
+        prediction = pd.read_csv(path)
+        expected_predict = (prediction["score"] >= 0.5).astype(np.int8)
+        assert prediction["predict"].astype(np.int8).equals(expected_predict)
     persisted = json.loads((output / "run_manifest.json").read_text(encoding="utf-8"))
     assert persisted["task"]["student_horizon_hours"] == 120.0
+    assert persisted["ofp_original_compatibility"]["lead_denominator"] == "all_faulty_modules"

@@ -15,11 +15,12 @@
 
 ## 2. 划分
 
-固定使用：
+单折开发入口 `run_experiment.py` 默认固定使用：
 
 - folds 1+2：development pool，再按模块和标签、seed 42 划分 train 与 validation；
-- fold 3：唯一测试集；
-- 不做三折模型池化，不平均多个 fold 的测试预测。
+- fold 3：默认 outer test fold；也可以显式指定 fold 1 或 fold 2，以供全量入口调用。
+
+全量 OFP 比较入口 `run_threefold.py` 分别以 fold 1、2、3 作为 outer test fold，产生三个互斥的 out-of-fold 决策集合，再拼接为 13,372 个模块的完整评估集。它不做模型集成，不平均多折预测，也不平均三个 fold 的 F1 或 Final Score；所有 pooled 指标都从拼接后的模块决策重新计算。
 
 每次运行必须保存 `split_manifest.csv` 与 split fingerprint。smoke 模式可以限制每个 split 的模块数，但其结果只能用于实现验证。
 
@@ -187,6 +188,26 @@ final_score = F1 + accuracy + tanh(AvgLead) + tanh(MinLead)
 二者的输入、student 参数量、划分、训练预算、阈值策略和 evaluator 必须一致。结果表至少报告 final score、F1、precision、recall、accuracy、AvgLead、MinLead、阈值、student 参数量、teacher 训练参数量、总耗时和 FGL 覆盖率。
 
 在正式 fold 3 结果产生前，只能说明“实现了”或“验证了机制闭环”，不能宣称效果提高。即使 N1 在一次测试上优于 N0，也应结合随机种子或预注册复现实验后再形成稳定论文结论。
+
+### 10.1 OFP 全量三折比较
+
+OFP 全量比较不是“在全部 13,372 个模块上训练并测试同一个模型”，而是三个 outer folds 的 out-of-fold 测试决策池化：
+
+```text
+fold 1 test: 4,457 modules (1,367 faulty)
+fold 2 test: 4,457 modules (1,367 faulty)
+fold 3 test: 4,458 modules (1,368 faulty)
+pooled:     13,372 modules (4,102 faulty + 9,270 normal)
+```
+
+每次训练只能访问另外两个 folds；其内部 validation 完成 early stopping 和主协议阈值选择后，才允许读取 outer-test CSV。三个测试决策表必须模块级互斥且并集等于索引全集。pooled confusion matrix、lead 和 final score 必须从 13,372 行模块决策重新计算，禁止平均三个 fold 的 F1 或 final score。
+
+同一份 out-of-fold score 输出两个彼此独立的评价协议：
+
+1. `legacy_inclusive_v1`：当前论文主协议，`alarm_ts <= failure_ts`，每折 validation-selected threshold；
+2. `ofp_original_strict_v1`：Model1/OFP 根 evaluator 兼容协议，`alarm_ts < failure_ts`，固定 0.5，`AvgLead = lead_sum / all_faulty_modules`。
+
+第二行只冻结可由源码确认的评价语义。原 README 背后的部分模型训练与阈值来源无法从仓库快照完整重建，因此必须标注 Historical Reference，而不能声称完全复现其训练过程。
 
 ## 11. 产物审计要求
 

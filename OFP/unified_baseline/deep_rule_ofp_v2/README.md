@@ -2,7 +2,7 @@
 
 本目录是一套面向光模块 **Failure Prediction（故障预测）** 的独立升级实现。运行时只依赖本目录内的 `fgofp` 包，不依赖同级的 `ofp_unified` 或旧 baseline 源码。它不会覆盖、迁移或静默改变旧版 [`../deep_rule_ofp`](../deep_rule_ofp)；旧版结果仍按旧版配置解释，新旧目录的模型、协议和产物不能混用。
 
-当前 v2 刻意收紧研究范围，只回答一个问题：在 OFP 的模块级评价下，使用原生约 5 分钟观测序列的因果深度模型，能否从 Future-window CE 进一步受益于 Future-Guided Learning（FGL）。本版本只支持 `legacy_inclusive_v1`，不把规则分支、采样增强或模型融合悄悄加入主实验。
+当前 v2 刻意收紧研究范围，只回答一个问题：在 OFP 的模块级评价下，使用原生约 5 分钟观测序列的因果深度模型，能否从 Future-window CE 进一步受益于 Future-Guided Learning（FGL）。论文主协议仍且仅为 `legacy_inclusive_v1`，不把规则分支、采样增强或模型融合悄悄加入主实验；全量三折入口另外输出一个冻结的 `ofp_original_strict_v1` 兼容评估行，只用于和历史 OFP 结果并列核对，不构成第二种训练目标或模型。
 
 > 重要说明：本文档定义的是可复现实验协议，不代表模型已经获得提升，也不代表 FGL 本身是本工作的原创方法。FGL 的方法依据来自 [A predictive approach to enhance time-series forecasting](https://www.nature.com/articles/s41467-025-63786-4)。
 
@@ -146,7 +146,7 @@ python -B OFP/unified_baseline/deep_rule_ofp_v2/run_experiment.py \
   --output-dir OFP/unified_baseline/deep_rule_ofp_v2/artifacts/smoke
 ```
 
-正式运行默认 N1（CE + FGL）：
+单折正式运行默认 N1（CE + FGL）。该命令只评估 fold 3 的 4,458 个模块，适合机制开发，但不能直接与 OFP 的 13,372 模块三折 pooled 历史表比较：
 
 ```bash
 python -B OFP/unified_baseline/deep_rule_ofp_v2/run_experiment.py \
@@ -155,6 +155,36 @@ python -B OFP/unified_baseline/deep_rule_ofp_v2/run_experiment.py \
   --data-dir dataset/training \
   --index-path 'dataset/train_test_set_index(in).csv' \
   --output-dir OFP/unified_baseline/deep_rule_ofp_v2/artifacts/N1_native_s2s_ce_fgl
+```
+
+与 OFP 全量模块覆盖对齐的 N1 三折 out-of-fold 正式运行：
+
+```bash
+python -B OFP/unified_baseline/deep_rule_ofp_v2/run_threefold.py \
+  --device cuda \
+  --data-dir dataset/training \
+  --index-path 'dataset/train_test_set_index(in).csv' \
+  --output-dir OFP/unified_baseline/deep_rule_ofp_v2/artifacts/N1_threefold_full
+```
+
+该入口依次运行三个独立 outer folds：每次以一个 fold 为测试集，从另外两个 folds 内部划出 10% validation 用于 early stopping 和当前主协议阈值选择。三个 outer-test 决策互不重叠，最终覆盖 `4457 + 4457 + 4458 = 13,372` 个模块；pooled F1、Accuracy 和 Final Score 从拼接后的模块决策重新计算，绝不平均三个折的指标。
+
+根目录 `comparison.csv` 同时包含两行，不能混为一个排名：
+
+- `legacy_inclusive_v1`：论文当前主协议，故障时刻报警有效，每折 validation-selected threshold；
+- `ofp_original_strict_v1`：根目录原始 `OFP/EvaluateResult.py` 兼容协议，严格故障前报警、固定阈值 0.5、提前量总和除以全部故障模块，用于和 Model1/OFP 历史结果并列。
+
+仓库快照不能完整恢复 README 中每个历史模型的训练过程，因此第二行是**评估协议兼容结果**，不应写成对历史 XGB 训练过程的逐字复现。深度模型每折仍保留内部 validation，实际参数训练使用约 90% 的两折 development；测试模块覆盖与评价口径严格冻结，但训练样本量不应宣称与历史 checkpoint 完全相同。
+
+三折机制 smoke（只验证流程，不能作为正式比较结果）：
+
+```bash
+python -B OFP/unified_baseline/deep_rule_ofp_v2/run_threefold.py \
+  --smoke \
+  --device cuda \
+  --data-dir dataset/training \
+  --index-path 'dataset/train_test_set_index(in).csv' \
+  --output-dir OFP/unified_baseline/deep_rule_ofp_v2/artifacts/N1_threefold_smoke
 ```
 
 一条命令运行训练目标消融：
@@ -192,9 +222,13 @@ N0 与 N1 必须共享数据划分、标准化、TCN 架构、student epoch、�
 - `validation_module_decisions.csv`、`test_module_decisions.csv`：可审计模块级 TP/FP/FN/TN、首次报警和提前量；
 - `checkpoints/student_best.pt`：可部署 student，含冻结阈值且不含 teacher 参数；
 - `checkpoints/teacher_train_only.pt`：仅 N1 保存的训练期 teacher；
-- `ofp_predictions/*.csv`：逐模块 `timestamp,predict,score` OFP 兼容输出；
-- `result.csv`：该次 fold 3 主结果；
+- `ofp_predictions/*.csv`：使用该折 validation-selected threshold 的 Legacy-Inclusive 逐模块输出；
+- `ofp_predictions_original_fixed_0.5/*.csv`：固定阈值 0.5、可交给根目录 `OFP/EvaluateResult.py` 复核的 strict OFP 逐模块输出；
+- `result.csv`：该次所选 outer test fold 的 Legacy-Inclusive 主结果；
+- `result_ofp_original.csv`：同一批 score 在固定 0.5 下的 strict OFP 兼容结果；
 - `run_manifest.json`：配置/划分指纹、FGL 覆盖、读取顺序、运行环境和主指标。
+
+三折入口额外保存 `fold_1/`、`fold_2/`、`fold_3/` 的完整单折产物，以及根目录的 `fold_metrics.csv`、`fold_metrics_ofp_original.csv`、`pooled/`、`comparison.csv` 和聚合审计 `run_manifest.json`。
 
 添加 `--save-long-scores` 时，还会保存压缩的 `validation_scores.csv.gz` 和 `test_scores.csv.gz`。suite 汇总表应以 `comparison.csv` 为入口，直接比较 N0 与 N1。
 

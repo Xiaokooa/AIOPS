@@ -255,40 +255,38 @@ def test_inference_only_dataset_builds_no_future_targets_or_alignment() -> None:
 
 def test_fixed_split_is_seeded_stratified_and_has_no_module_leakage() -> None:
     rows: list[dict[str, int | str]] = []
-    for fold in (1, 2):
+    for fold in (1, 2, 3):
         for label in (0, 1):
             for index in range(10):
                 rows.append(
                     {
-                        "file_name": f"dev-{fold}-{label}-{index}.csv",
+                        "file_name": f"module-{fold}-{label}-{index}.csv",
                         "folder_index": fold,
                         "Label": label,
                     }
                 )
-    for label in (0, 1):
-        for index in range(4):
-            rows.append(
-                {
-                    "file_name": f"test-{label}-{index}.csv",
-                    "folder_index": 3,
-                    "Label": label,
-                }
-            )
     index_frame = pd.DataFrame(rows)
 
-    first = build_fixed_split(index_frame, validation_fraction=0.1, seed=7)
-    second = build_fixed_split(index_frame, validation_fraction=0.1, seed=7)
+    for test_fold in (1, 2, 3):
+        first = build_fixed_split(
+            index_frame, validation_fraction=0.1, seed=7, test_fold=test_fold
+        )
+        second = build_fixed_split(
+            index_frame, validation_fraction=0.1, seed=7, test_fold=test_fold
+        )
 
-    assert first.validation["file_name"].tolist() == second.validation["file_name"].tolist()
-    assert set(first.test["folder_index"]) == {3}
-    assert len(first.validation) == 4
-    assert first.validation["Label"].value_counts().to_dict() == {0: 2, 1: 2}
-    train_names = set(first.train["file_name"])
-    validation_names = set(first.validation["file_name"])
-    test_names = set(first.test["file_name"])
-    assert not train_names & validation_names
-    assert not train_names & test_names
-    assert not validation_names & test_names
+        assert first.validation["file_name"].tolist() == second.validation["file_name"].tolist()
+        assert set(first.test["folder_index"]) == {test_fold}
+        assert set(first.train["folder_index"]) == {1, 2, 3} - {test_fold}
+        assert set(first.validation["folder_index"]) <= {1, 2, 3} - {test_fold}
+        assert len(first.validation) == 4
+        assert first.validation["Label"].value_counts().to_dict() == {0: 2, 1: 2}
+        train_names = set(first.train["file_name"])
+        validation_names = set(first.validation["file_name"])
+        test_names = set(first.test["file_name"])
+        assert not train_names & validation_names
+        assert not train_names & test_names
+        assert not validation_names & test_names
 
 
 def test_length_bucket_batch_sampler_covers_each_index_once() -> None:

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 
-def test_run_experiment_help_works_without_sibling_packages(tmp_path: Path) -> None:
+def test_entrypoint_help_works_without_sibling_packages(tmp_path: Path) -> None:
     """The published v2 directory must be runnable as a standalone checkout."""
 
     source = Path(__file__).resolve().parents[1]
@@ -24,14 +24,18 @@ def test_run_experiment_help_works_without_sibling_packages(tmp_path: Path) -> N
     )
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
-    completed = subprocess.run(
-        [sys.executable, "-B", str(standalone / "run_experiment.py"), "--help"],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert "Native-row sequence-to-sequence" in completed.stdout
+    for entrypoint, expected in (
+        ("run_experiment.py", "Native-row sequence-to-sequence"),
+        ("run_threefold.py", "13,372-module"),
+    ):
+        completed = subprocess.run(
+            [sys.executable, "-B", str(standalone / entrypoint), "--help"],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert expected in completed.stdout.replace("\n", " ")

@@ -12,7 +12,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fgofp.evaluation import (  # noqa: E402
+    OFP_ORIGINAL_PROTOCOL_NAME,
     evaluate_legacy_inclusive,
+    evaluate_ofp_original_strict,
+    metrics_from_module_decisions,
     search_validation_threshold,
     write_module_predictions,
 )
@@ -69,6 +72,115 @@ def test_legacy_inclusive_full_module_outcomes_and_score() -> None:
         expected_avg
     )
     assert metrics["final_score"] == pytest.approx(expected_final)
+
+
+def test_original_ofp_strict_requires_alarm_before_failure_timestamp() -> None:
+    strict = evaluate_ofp_original_strict(_protocol_frame(), threshold=0.8)
+    metrics = strict.metrics
+    detail = strict.detail.set_index("file_name")
+
+    assert metrics["protocol"] == OFP_ORIGINAL_PROTOCOL_NAME
+    assert (metrics["tp"], metrics["fp"], metrics["fn"], metrics["tn"]) == (
+        1,
+        1,
+        3,
+        1,
+    )
+    assert detail.loc["pre.csv", "outcome"] == "TP"
+    assert detail.loc["pre.csv", "lead_hour"] == pytest.approx(9.0 / 3600.0)
+    assert detail.loc["same.csv", "outcome"] == "FN"
+    assert pd.isna(detail.loc["same.csv", "first_alarm_timestamp"])
+    assert detail.loc["same.csv", "first_any_alarm_timestamp"] == 1_700_000_020
+    assert detail.loc["same.csv", "postfault_only_alarm"] == 1
+    assert detail.loc["post.csv", "outcome"] == "FN"
+    assert detail.loc["normal_fp.csv", "outcome"] == "FP"
+    assert metrics["at_failure_hit_count"] == 0
+    assert metrics["postfault_only_alarm_count"] == 2
+
+    # The frozen comparison convention divides total hit lead by every faulty
+    # module, not only by the single hit module.
+    expected_lead_sum = 9.0 / 3600.0
+    expected_avg = expected_lead_sum / 4.0
+    assert metrics["lead_sum_hour"] == pytest.approx(expected_lead_sum)
+    assert metrics["avg_lead_hour"] == pytest.approx(expected_avg)
+    assert metrics["min_lead_hour"] == pytest.approx(expected_lead_sum)
+    expected_final = (
+        metrics["f1_score"]
+        + metrics["accuracy"]
+        + math.tanh(expected_avg)
+        + math.tanh(expected_lead_sum)
+    )
+    assert metrics["final_score"] == pytest.approx(expected_final)
+
+    # Legacy-Inclusive intentionally differs only at equality: same.csv is a
+    # valid zero-lead hit there and remains covered by its existing evaluator.
+    inclusive = evaluate_legacy_inclusive(_protocol_frame(), threshold=0.8)
+    assert inclusive.detail.set_index("file_name").loc["same.csv", "outcome"] == "TP"
+    assert inclusive.metrics["tp"] == 2
+
+
+def test_pooled_metrics_are_recomputed_from_concatenated_strict_decisions() -> None:
+    frame = _protocol_frame()
+    fold_modules = (
+        {"same.csv", "pre.csv", "normal_fp.csv"},
+        {"post.csv", "normal_tn.csv"},
+        {"miss.csv"},
+    )
+    fold_results = [
+        evaluate_ofp_original_strict(
+            frame.loc[frame["file_name"].isin(modules)].copy(), threshold=0.8
+        )
+        for modules in fold_modules
+    ]
+    pooled_detail = pd.DataFrame.from_records(
+        [
+            {**record, "fold": fold}
+            for fold, result in enumerate(fold_results, start=1)
+            for record in result.detail.to_dict(orient="records")
+        ]
+    )
+
+    pooled = metrics_from_module_decisions(
+        pooled_detail, protocol=OFP_ORIGINAL_PROTOCOL_NAME
+    )
+    direct = evaluate_ofp_original_strict(frame, threshold=0.8).metrics
+    for name in (
+        "final_score",
+        "f1_score",
+        "precision",
+        "recall",
+        "accuracy",
+        "avg_lead_hour",
+        "min_lead_hour",
+        "lead_sum_hour",
+        "tp",
+        "fp",
+        "fn",
+        "tn",
+        "module_count",
+    ):
+        assert pooled[name] == pytest.approx(direct[name])
+
+    fold_mean_f1 = float(
+        np.mean([result.metrics["f1_score"] for result in fold_results])
+    )
+    assert pooled["f1_score"] != pytest.approx(fold_mean_f1)
+    assert pooled["module_count"] == 6
+
+
+def test_pooled_metric_input_rejects_protocol_inconsistent_decisions() -> None:
+    inclusive = evaluate_legacy_inclusive(_protocol_frame(), threshold=0.8)
+    with pytest.raises(ValueError, match="positive lead_hour"):
+        metrics_from_module_decisions(
+            inclusive.detail, protocol=OFP_ORIGINAL_PROTOCOL_NAME
+        )
+    with pytest.raises(ValueError, match="unsupported evaluation protocol"):
+        metrics_from_module_decisions(inclusive.detail, protocol="unknown")
+
+    malformed = inclusive.detail.copy()
+    malformed.loc[malformed["outcome"] == "FN", "lead_hour"] = 1.0
+    with pytest.raises(ValueError, match="non-TP"):
+        metrics_from_module_decisions(malformed)
 
 
 def test_timestamp_is_exact_int64_and_fractional_seconds_are_rejected() -> None:

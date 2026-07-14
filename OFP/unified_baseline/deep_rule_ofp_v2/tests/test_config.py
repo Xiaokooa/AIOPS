@@ -50,3 +50,18 @@ def test_only_legacy_inclusive_and_native_rows_are_supported() -> None:
     payload["inputs"]["cadence_mode"] = "hourly"
     with pytest.raises(ValueError, match="only native_observed_rows"):
         config_from_dict(payload)
+
+
+@pytest.mark.parametrize("test_fold", (1, 2, 3))
+def test_each_outer_test_fold_is_supported(test_fold: int) -> None:
+    payload = json.loads((ROOT / "configs" / "default.json").read_text(encoding="utf-8"))
+    payload["split"]["test_fold"] = test_fold
+    assert config_from_dict(payload).split.test_fold == test_fold
+
+
+@pytest.mark.parametrize("test_fold", (0, 4))
+def test_unknown_outer_test_fold_is_rejected(test_fold: int) -> None:
+    payload = json.loads((ROOT / "configs" / "default.json").read_text(encoding="utf-8"))
+    payload["split"]["test_fold"] = test_fold
+    with pytest.raises(ValueError, match="one of 1, 2, or 3"):
+        config_from_dict(payload)

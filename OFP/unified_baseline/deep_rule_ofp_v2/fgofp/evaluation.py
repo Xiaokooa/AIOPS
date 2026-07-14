@@ -21,6 +21,8 @@ import pandas as pd
 
 
 PROTOCOL_NAME = "legacy_inclusive_v1"
+OFP_ORIGINAL_PROTOCOL_NAME = "ofp_original_strict_v1"
+_SUPPORTED_PROTOCOLS = frozenset((PROTOCOL_NAME, OFP_ORIGINAL_PROTOCOL_NAME))
 _TIMESTAMP_SECONDS = "__fgofp_timestamp_seconds"
 _ANOMALY = "__fgofp_anomaly"
 
@@ -49,6 +51,121 @@ class ThresholdSearchResult:
 
 def _safe_ratio(numerator: float, denominator: float) -> float:
     return float(numerator / denominator) if denominator else 0.0
+
+
+def metrics_from_module_decisions(
+    detail: pd.DataFrame,
+    protocol: str = PROTOCOL_NAME,
+) -> dict[str, Any]:
+    """Recompute protocol metrics from one row per evaluated module.
+
+    This is the only scalar-metric implementation used by both direct
+    evaluators and by three-fold pooling.  Consequently pooled metrics are
+    calculated from concatenated out-of-fold module decisions rather than by
+    averaging fold-level scores.
+
+    Both supported protocols divide the sum of hit lead times by *all faulty
+    modules*.  Their only decision difference is whether an alarm exactly at
+    the first failure timestamp is eligible: Legacy-Inclusive accepts it,
+    while the original OFP protocol requires a strictly earlier alarm.
+    """
+
+    protocol = str(protocol)
+    if protocol not in _SUPPORTED_PROTOCOLS:
+        raise ValueError(
+            f"unsupported evaluation protocol {protocol!r}; "
+            f"expected one of {sorted(_SUPPORTED_PROTOCOLS)}"
+        )
+    _require_columns(
+        detail,
+        ("outcome", "lead_hour", "alarm_at_failure", "postfault_only_alarm"),
+    )
+    if detail.empty:
+        raise ValueError("cannot compute metrics from an empty module decision table")
+
+    outcomes = detail["outcome"].astype(str)
+    allowed_outcomes = {"TP", "FP", "FN", "TN"}
+    invalid_outcomes = sorted(set(outcomes) - allowed_outcomes)
+    if invalid_outcomes:
+        raise ValueError(f"invalid module outcomes: {invalid_outcomes}")
+
+    tp_mask = outcomes == "TP"
+    fp_mask = outcomes == "FP"
+    fn_mask = outcomes == "FN"
+    tn_mask = outcomes == "TN"
+    tp = int(tp_mask.sum())
+    fp = int(fp_mask.sum())
+    fn = int(fn_mask.sum())
+    tn = int(tn_mask.sum())
+    module_count = tp + fp + fn + tn
+    if module_count != len(detail):
+        raise ValueError("every module decision must have exactly one valid outcome")
+
+    lead = pd.to_numeric(detail["lead_hour"], errors="coerce")
+    hit_leads = lead.loc[tp_mask]
+    if hit_leads.isna().any() or not np.isfinite(hit_leads.to_numpy(dtype=np.float64)).all():
+        raise ValueError("every TP module must have a finite lead_hour")
+    if (hit_leads < 0.0).any():
+        raise ValueError("TP lead_hour cannot be negative")
+    if protocol == OFP_ORIGINAL_PROTOCOL_NAME and (hit_leads <= 0.0).any():
+        raise ValueError("strict OFP TP decisions must have a positive lead_hour")
+    if lead.loc[~tp_mask].notna().any():
+        raise ValueError("non-TP module decisions must not have lead_hour")
+
+    for column in ("alarm_at_failure", "postfault_only_alarm"):
+        values = pd.to_numeric(detail[column], errors="coerce")
+        if values.isna().any() or not values.isin((0, 1)).all():
+            raise ValueError(f"{column} must contain only 0/1 values")
+    alarm_at_failure = pd.to_numeric(
+        detail["alarm_at_failure"], errors="raise"
+    ).astype(np.int64)
+    postfault_only = pd.to_numeric(
+        detail["postfault_only_alarm"], errors="raise"
+    ).astype(np.int64)
+    if protocol == OFP_ORIGINAL_PROTOCOL_NAME and int(alarm_at_failure.sum()) != 0:
+        raise ValueError("strict OFP decisions cannot count at-failure alarms as hits")
+
+    faulty_count = tp + fn
+    normal_count = fp + tn
+    predicted_positive = tp + fp
+    precision = _safe_ratio(tp, predicted_positive)
+    recall = _safe_ratio(tp, faulty_count)
+    f1_score = _safe_ratio(2.0 * precision * recall, precision + recall)
+    accuracy = _safe_ratio(tp + tn, module_count)
+    lead_sum_hour = float(hit_leads.sum()) if tp else 0.0
+    avg_lead_hour = _safe_ratio(lead_sum_hour, faulty_count)
+    min_lead_hour = float(hit_leads.min()) if tp else 0.0
+    avg_lead_score = math.tanh(avg_lead_hour)
+    min_lead_score = math.tanh(min_lead_hour)
+    final_score = f1_score + accuracy + avg_lead_score + min_lead_score
+
+    return {
+        "protocol": protocol,
+        "final_score": float(final_score),
+        "f1_score": float(f1_score),
+        "precision": float(precision),
+        "recall": float(recall),
+        "accuracy": float(accuracy),
+        "avg_lead_hour": float(avg_lead_hour),
+        "min_lead_hour": float(min_lead_hour),
+        "avg_lead_score": float(avg_lead_score),
+        "min_lead_score": float(min_lead_score),
+        "lead_sum_hour": float(lead_sum_hour),
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+        "all_hit_cnt": tp,
+        "all_predict_pos_cnt": predicted_positive,
+        "all_true_pos_cnt": faulty_count,
+        "lead_pred_cnt": tp,
+        "module_count": module_count,
+        "faulty_module_count": faulty_count,
+        "normal_module_count": normal_count,
+        "normal_module_false_alarm_rate": _safe_ratio(fp, normal_count),
+        "at_failure_hit_count": int(alarm_at_failure.sum()),
+        "postfault_only_alarm_count": int(postfault_only.sum()),
+    }
 
 
 def _require_columns(frame: pd.DataFrame, columns: Iterable[str]) -> None:
@@ -180,7 +297,11 @@ def _module_metrics(
     decisions: pd.Series,
     *,
     module_col: str,
+    protocol: str = PROTOCOL_NAME,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
+    if protocol not in _SUPPORTED_PROTOCOLS:
+        raise ValueError(f"unsupported evaluation protocol: {protocol!r}")
+    inclusive = protocol == PROTOCOL_NAME
     decisions = decisions.reindex(work.index, fill_value=False).astype(bool)
     records: list[dict[str, Any]] = []
 
@@ -192,10 +313,15 @@ def _module_metrics(
             first_fault_position = int(
                 np.flatnonzero(failure_mask.to_numpy(dtype=bool))[0]
             )
-            decision_prefix = group.index[: first_fault_position + 1]
             failure_seconds = int(
                 group.iloc[first_fault_position][_TIMESTAMP_SECONDS]
             )
+            if inclusive:
+                decision_prefix = group.index[: first_fault_position + 1]
+            else:
+                decision_prefix = group.index[
+                    group[_TIMESTAMP_SECONDS] < failure_seconds
+                ]
         else:
             first_fault_position = None
             decision_prefix = group.index
@@ -214,14 +340,19 @@ def _module_metrics(
             else None
         )
 
-        # Frozen Legacy-Inclusive rule: equality is a valid hit.  An alarm that
-        # exists only after failure remains an FN rather than an FP or TP.
+        # A faulty module is positive only when its first decision-eligible
+        # alarm satisfies the selected protocol. An alarm that exists only at
+        # or after failure remains an FN rather than an FP or TP.
         is_hit = bool(
             is_faulty
             and has_eligible_alarm
             and alarm_seconds is not None
             and failure_seconds is not None
-            and alarm_seconds <= failure_seconds
+            and (
+                alarm_seconds <= failure_seconds
+                if inclusive
+                else alarm_seconds < failure_seconds
+            )
         )
         if is_faulty:
             outcome = "TP" if is_hit else "FN"
@@ -257,6 +388,12 @@ def _module_metrics(
                 "has_any_alarm": int(has_any_alarm),
                 "has_decision_eligible_alarm": int(has_eligible_alarm),
                 "alarm_at_or_before_failure": int(is_hit),
+                "alarm_before_failure": int(
+                    is_hit
+                    and alarm_seconds is not None
+                    and failure_seconds is not None
+                    and alarm_seconds < failure_seconds
+                ),
                 "alarm_at_failure": int(alarm_at_failure),
                 "postfault_only_alarm": int(postfault_only),
                 "alarm_row_count": int(group_decisions.sum()),
@@ -279,6 +416,7 @@ def _module_metrics(
                 "has_any_alarm",
                 "has_decision_eligible_alarm",
                 "alarm_at_or_before_failure",
+                "alarm_before_failure",
                 "alarm_at_failure",
                 "postfault_only_alarm",
                 "alarm_row_count",
@@ -286,59 +424,7 @@ def _module_metrics(
                 "lead_hour",
             ]
         )
-    outcomes = detail["outcome"]
-    tp = int((outcomes == "TP").sum())
-    fp = int((outcomes == "FP").sum())
-    fn = int((outcomes == "FN").sum())
-    tn = int((outcomes == "TN").sum())
-    faulty_count = tp + fn
-    normal_count = fp + tn
-    module_count = tp + fp + fn + tn
-    predicted_positive = tp + fp
-
-    precision = _safe_ratio(tp, predicted_positive)
-    recall = _safe_ratio(tp, faulty_count)
-    f1_score = _safe_ratio(2.0 * precision * recall, precision + recall)
-    accuracy = _safe_ratio(tp + tn, module_count)
-    hit_leads = pd.to_numeric(
-        detail.loc[outcomes == "TP", "lead_hour"], errors="coerce"
-    ).dropna()
-    lead_sum_hour = float(hit_leads.sum()) if len(hit_leads) else 0.0
-    avg_lead_hour = _safe_ratio(lead_sum_hour, faulty_count)
-    # Equality hits contribute zero and therefore correctly force the minimum
-    # hit lead to zero when present.
-    min_lead_hour = float(hit_leads.min()) if len(hit_leads) else 0.0
-    avg_lead_score = math.tanh(avg_lead_hour)
-    min_lead_score = math.tanh(min_lead_hour)
-    final_score = f1_score + accuracy + avg_lead_score + min_lead_score
-
-    metrics: dict[str, Any] = {
-        "protocol": PROTOCOL_NAME,
-        "final_score": float(final_score),
-        "f1_score": float(f1_score),
-        "precision": float(precision),
-        "recall": float(recall),
-        "accuracy": float(accuracy),
-        "avg_lead_hour": float(avg_lead_hour),
-        "min_lead_hour": float(min_lead_hour),
-        "avg_lead_score": float(avg_lead_score),
-        "min_lead_score": float(min_lead_score),
-        "lead_sum_hour": float(lead_sum_hour),
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "tn": tn,
-        "all_hit_cnt": tp,
-        "all_predict_pos_cnt": predicted_positive,
-        "all_true_pos_cnt": faulty_count,
-        "lead_pred_cnt": tp,
-        "module_count": module_count,
-        "faulty_module_count": faulty_count,
-        "normal_module_count": normal_count,
-        "normal_module_false_alarm_rate": _safe_ratio(fp, normal_count),
-        "at_failure_hit_count": int(detail["alarm_at_failure"].sum()),
-        "postfault_only_alarm_count": int(detail["postfault_only_alarm"].sum()),
-    }
+    metrics = metrics_from_module_decisions(detail, protocol=protocol)
     return metrics, detail
 
 
@@ -367,6 +453,47 @@ def evaluate_legacy_inclusive(
         predict_col=predict_col,
     )
     metrics, detail = _module_metrics(work, decisions, module_col=module_col)
+    metrics["decision_threshold"] = float(threshold)
+    metrics["decision_source"] = source
+    return LegacyEvaluationResult(metrics=metrics, detail=detail)
+
+
+def evaluate_ofp_original_strict(
+    frame: pd.DataFrame,
+    threshold: float = 0.5,
+    *,
+    module_col: str = "file_name",
+    timestamp_col: str = "timestamp",
+    anomaly_col: str = "anomaly",
+    score_col: str = "score",
+    predict_col: str | None = None,
+) -> LegacyEvaluationResult:
+    """Evaluate the original OFP module decision with strict lead time.
+
+    A faulty module is hit only when its first eligible alarm timestamp is
+    strictly less than its first failure timestamp.  Equality and post-fault
+    alarms are not hits.  A normal module is a false positive when it raises an
+    alarm at any observed row.
+    """
+
+    work = _prepare_frame(
+        frame,
+        module_col=module_col,
+        timestamp_col=timestamp_col,
+        anomaly_col=anomaly_col,
+    )
+    decisions, _, source = _decisions(
+        work,
+        threshold=threshold,
+        score_col=score_col,
+        predict_col=predict_col,
+    )
+    metrics, detail = _module_metrics(
+        work,
+        decisions,
+        module_col=module_col,
+        protocol=OFP_ORIGINAL_PROTOCOL_NAME,
+    )
     metrics["decision_threshold"] = float(threshold)
     metrics["decision_source"] = source
     return LegacyEvaluationResult(metrics=metrics, detail=detail)
@@ -649,13 +776,16 @@ write_ofp_module_csvs = write_module_predictions
 
 
 __all__ = [
+    "OFP_ORIGINAL_PROTOCOL_NAME",
     "PROTOCOL_NAME",
     "LegacyEvaluationResult",
     "OFPEvaluationResult",
     "ThresholdSearchResult",
     "evaluate_legacy_inclusive",
+    "evaluate_ofp_original_strict",
     "evaluate_ofp",
     "evaluate_ofp_long_frame",
+    "metrics_from_module_decisions",
     "search_validation_threshold",
     "threshold_candidates",
     "write_module_predictions",

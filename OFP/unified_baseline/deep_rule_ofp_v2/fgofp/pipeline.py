@@ -27,8 +27,10 @@ from .data import (
     load_module_records,
 )
 from .evaluation import (
+    OFP_ORIGINAL_PROTOCOL_NAME,
     PROTOCOL_NAME,
     evaluate_legacy_inclusive,
+    evaluate_ofp_original_strict,
     search_validation_threshold,
     write_module_predictions,
 )
@@ -163,9 +165,11 @@ def _prepare_output(output_dir: Path, overwrite: bool) -> None:
             "effective_config.json",
             "normalizer.json",
             "result.csv",
+            "result_ofp_original.csv",
             "run_manifest.json",
             "split_manifest.csv",
             "test_module_decisions.csv",
+            "test_module_decisions_ofp_original.csv",
             "test_scores.csv.gz",
             "training_history.csv",
             "validation_module_decisions.csv",
@@ -176,7 +180,11 @@ def _prepare_output(output_dir: Path, overwrite: bool) -> None:
             target = output_dir / name
             if target.is_file():
                 target.unlink()
-        for name in ("checkpoints", "ofp_predictions"):
+        for name in (
+            "checkpoints",
+            "ofp_predictions",
+            "ofp_predictions_original_fixed_0.5",
+        ):
             target = output_dir / name
             if target.is_dir():
                 shutil.rmtree(target)
@@ -293,7 +301,7 @@ def run_experiment(
     save_long_scores: bool = False,
     progress: bool = True,
 ) -> dict[str, Any]:
-    """Train, freeze a validation threshold, then read and evaluate fold 3."""
+    """Train, freeze a validation threshold, then evaluate one outer fold."""
 
     started = time.perf_counter()
     data_dir = Path(data_dir)
@@ -327,8 +335,8 @@ def run_experiment(
         flush=True,
     )
 
-    # Fold-3 CSV contents are deliberately not opened before the validation
-    # threshold is frozen. Membership metadata in the public index is safe.
+    # Outer-test-fold CSV contents are deliberately not opened before the
+    # validation threshold is frozen. Public index membership metadata is safe.
     data_started = time.perf_counter()
     print("[data] loading train native-row modules", flush=True)
     train_records = load_module_records(
@@ -430,7 +438,7 @@ def run_experiment(
         )
     print(
         f"[decision] validation threshold frozen at {threshold:.9f}; "
-        "fold-3 CSV loading may now begin",
+        f"fold-{config.split.test_fold} CSV loading may now begin",
         flush=True,
     )
 
@@ -473,7 +481,7 @@ def run_experiment(
             checkpoints / "teacher_train_only.pt",
         )
 
-    # Release the ~15M train/validation native rows before loading fold 3.
+    # Release train/validation native rows before loading the outer test fold.
     del (
         train_dataset,
         validation_training_dataset,
@@ -485,7 +493,10 @@ def run_experiment(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    print("[data] loading fold-3 test native-row modules", flush=True)
+    print(
+        f"[data] loading fold-{config.split.test_fold} test native-row modules",
+        flush=True,
+    )
     test_load_started = time.perf_counter()
     test_records = load_module_records(
         data_dir,
@@ -500,16 +511,35 @@ def run_experiment(
         truncate_after_first_fault=False,
         include_supervision=False,
     )
-    print("[inference] fold-3 test student only", flush=True)
+    print(
+        f"[inference] fold-{config.split.test_fold} test student only",
+        flush=True,
+    )
     test_frame = infer_student(
         training.student, test_dataset, config, progress_label="test"
     )
     test_result = evaluate_legacy_inclusive(test_frame, threshold=threshold)
     test_result.detail.to_csv(output_dir / "test_module_decisions.csv", index=False)
+    # This secondary row freezes the root OFP/EvaluateResult.py semantics for
+    # historical Model1 comparison.  It does not replace the paper's primary
+    # Legacy-Inclusive protocol and never changes the trained model.
+    ofp_original_threshold = 0.5
+    ofp_original_result = evaluate_ofp_original_strict(
+        test_frame, threshold=ofp_original_threshold
+    )
+    ofp_original_result.detail.to_csv(
+        output_dir / "test_module_decisions_ofp_original.csv", index=False
+    )
     write_module_predictions(
         test_frame,
         output_dir / "ofp_predictions",
         threshold=threshold,
+        overwrite=True,
+    )
+    write_module_predictions(
+        test_frame,
+        output_dir / "ofp_predictions_original_fixed_0.5",
+        threshold=ofp_original_threshold,
         overwrite=True,
     )
     if save_long_scores:
@@ -527,6 +557,7 @@ def run_experiment(
         "experiment_id": config.experiment_name,
         "variant": variant,
         "changed_axis": "training_objective",
+        "test_fold": int(config.split.test_fold),
         "protocol": PROTOCOL_NAME,
         "native_rows": True,
         "sequence_to_sequence": True,
@@ -557,6 +588,25 @@ def run_experiment(
         **metrics,
     }
     pd.DataFrame([result_row]).to_csv(output_dir / "result.csv", index=False)
+    ofp_original_metrics = {
+        name: _scalar(value) for name, value in ofp_original_result.metrics.items()
+    }
+    pd.DataFrame(
+        [
+            {
+                "experiment_id": config.experiment_name,
+                "variant": variant,
+                "changed_axis": "evaluation_protocol",
+                "test_fold": int(config.split.test_fold),
+                "training_protocol": PROTOCOL_NAME,
+                "protocol": OFP_ORIGINAL_PROTOCOL_NAME,
+                "decision_threshold": ofp_original_threshold,
+                "threshold_policy": "fixed_0.5_model1_ofp_compatibility",
+                "seconds_total": float(time.perf_counter() - started),
+                **ofp_original_metrics,
+            }
+        ]
+    ).to_csv(output_dir / "result_ofp_original.csv", index=False)
 
     coverage = {name: _scalar(value) for name, value in training.coverage.items()}
     manifest: dict[str, Any] = {
@@ -565,6 +615,7 @@ def run_experiment(
         "variant": variant,
         "config_fingerprint": config.fingerprint(),
         "split_fingerprint": _fingerprint_split(split_table),
+        "outer_test_fold": int(config.split.test_fold),
         "split_counts": {
             "train": len(split.train),
             "validation": len(split.validation),
@@ -619,6 +670,19 @@ def run_experiment(
             "test_csv",
         ],
         "primary_metrics": metrics,
+        "ofp_original_compatibility": {
+            "protocol": OFP_ORIGINAL_PROTOCOL_NAME,
+            "hit_condition": "first_alarm_timestamp < first_failure_timestamp",
+            "decision_threshold": ofp_original_threshold,
+            "threshold_policy": "fixed_0.5_model1_ofp_compatibility",
+            "lead_denominator": "all_faulty_modules",
+            "metrics": ofp_original_metrics,
+            "historical_reference_warning": (
+                "The repository snapshot does not fully identify the training "
+                "run behind every README column; this freezes the root "
+                "OFP/EvaluateResult.py decision semantics."
+            ),
+        },
         "seconds": {
             "data_preparation_train_validation": data_preparation_seconds,
             "training": training.seconds_total,

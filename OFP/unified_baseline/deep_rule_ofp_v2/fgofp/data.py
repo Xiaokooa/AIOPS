@@ -681,14 +681,15 @@ def build_fixed_split(
     seed: int = 42,
     test_fold: int = FIXED_TEST_FOLD,
 ) -> SplitManifest:
-    """Use fold 3 as test and stratify 10% of folds 1+2 for validation."""
+    """Use one outer fold as test and split the other two for development."""
 
-    if int(test_fold) != FIXED_TEST_FOLD:
-        raise ValueError("the comparable OFP protocol fixes test_fold=3")
+    test_fold = int(test_fold)
+    if test_fold not in {1, 2, 3}:
+        raise ValueError("test_fold must be one of 1, 2, or 3")
     source = pd.read_csv(index) if isinstance(index, (str, Path)) else index
     frame = _validate_index(source)
-    development = frame.loc[frame["folder_index"].isin((1, 2))].copy()
-    test = frame.loc[frame["folder_index"] == FIXED_TEST_FOLD].copy()
+    development = frame.loc[frame["folder_index"] != test_fold].copy()
+    test = frame.loc[frame["folder_index"] == test_fold].copy()
     validation_positions = _stratified_validation_indices(
         development, validation_fraction, seed
     )

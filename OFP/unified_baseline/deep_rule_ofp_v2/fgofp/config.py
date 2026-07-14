@@ -113,8 +113,8 @@ class FGOFPConfig:
             )
         if abs(horizons[2] - 120.0) > 1e-9:
             raise ValueError("the frozen v2 student future window is 120 hours")
-        if self.split.test_fold != 3:
-            raise ValueError("the comparable OFP protocol fixes test_fold=3")
+        if int(self.split.test_fold) not in {1, 2, 3}:
+            raise ValueError("split.test_fold must be one of 1, 2, or 3")
         if not 0.0 < self.split.validation_fraction < 0.5:
             raise ValueError("validation_fraction must be in (0, 0.5)")
         if self.inputs.cadence_mode != "native_observed_rows":

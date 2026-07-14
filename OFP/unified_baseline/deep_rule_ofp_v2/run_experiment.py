@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--inference-batch-size", type=int, default=None)
     parser.add_argument("--experiment-name", type=str, default=None)
+    parser.add_argument("--test-fold", type=int, choices=(1, 2, 3), default=None)
     parser.add_argument("--fgl-alpha", type=float, default=None)
     parser.add_argument("--future-offset-hours", type=float, default=None)
     parser.add_argument("--alignment-tolerance-seconds", type=int, default=None)
@@ -60,6 +61,8 @@ def _overrides(args: argparse.Namespace) -> dict:
         )
     if args.experiment_name:
         overrides["experiment_name"] = str(args.experiment_name)
+    if args.test_fold is not None:
+        overrides.setdefault("split", {})["test_fold"] = int(args.test_fold)
     if args.fgl_alpha is not None:
         overrides.setdefault("training", {})["fgl_alpha"] = float(args.fgl_alpha)
     if args.disable_fgl:
