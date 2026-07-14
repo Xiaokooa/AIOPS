@@ -13,12 +13,42 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fgofp.evaluation import (  # noqa: E402
     OFP_ORIGINAL_PROTOCOL_NAME,
+    PROTOCOL_NAME,
+    evaluate_frozen_decision,
     evaluate_legacy_inclusive,
     evaluate_ofp_original_strict,
     metrics_from_module_decisions,
     search_validation_threshold,
+    select_validation_decision_source,
     write_module_predictions,
 )
+
+
+def _decision_selection_frame(
+    *,
+    residual_perfect: bool,
+    rule_perfect: bool,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for module, anomaly in (
+        ("fault.csv", [0, 1]),
+        ("normal.csv", [0, 0]),
+    ):
+        faulty = module == "fault.csv"
+        residual_alarm = faulty if residual_perfect else not faulty
+        rule_alarm = faulty if rule_perfect else not faulty
+        for timestamp, label in zip((0, 3600), anomaly):
+            rows.append(
+                {
+                    "file_name": module,
+                    "timestamp": np.int64(timestamp),
+                    "anomaly": label,
+                    "score": 0.9 if residual_alarm else 0.1,
+                    "rule_score": float(rule_alarm),
+                    "rule_predict": int(rule_alarm),
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def _protocol_frame() -> pd.DataFrame:
@@ -306,3 +336,126 @@ def test_writer_preserves_int64_score_predict_and_cleans_stale_csv(
 
     with pytest.raises(FileExistsError):
         write_module_predictions(frame, output, overwrite=False)
+
+
+def test_validation_safe_selection_falls_back_to_rule_when_residual_is_worse() -> None:
+    frame = _decision_selection_frame(residual_perfect=False, rule_perfect=True)
+
+    selected = select_validation_decision_source(
+        frame,
+        protocol=PROTOCOL_NAME,
+        residual_threshold=0.5,
+        residual_threshold_policy="validation_selected",
+    )
+
+    assert selected.decision_source == "rule_only"
+    assert selected.predict_col == "rule_predict"
+    assert selected.threshold_policy == "validation_safe_rule_fallback"
+    assert selected.table.loc[selected.table["selected"], "candidate"].item() == "rule_only"
+    direct = evaluate_legacy_inclusive(
+        frame,
+        score_col="rule_score",
+        predict_col="rule_predict",
+    )
+    assert selected.metrics["final_score"] == pytest.approx(
+        direct.metrics["final_score"]
+    )
+    assert evaluate_frozen_decision(frame, selected).metrics[
+        "final_score"
+    ] == pytest.approx(direct.metrics["final_score"])
+
+
+def test_validation_safe_selection_uses_residual_only_on_strict_gain() -> None:
+    frame = _decision_selection_frame(residual_perfect=True, rule_perfect=False)
+
+    selected = select_validation_decision_source(
+        frame,
+        protocol=OFP_ORIGINAL_PROTOCOL_NAME,
+        residual_threshold=0.5,
+        residual_threshold_policy="fixed_0.5_model1_ofp_compatibility",
+    )
+
+    assert selected.decision_source == "rule_guided_residual"
+    assert selected.predict_col is None
+    assert selected.metrics["validation_delta_final_score_vs_rule_only"] > 0.0
+
+
+def test_validation_safe_selection_tie_prefers_rule_and_rejects_test_selection() -> None:
+    frame = _decision_selection_frame(residual_perfect=True, rule_perfect=True)
+
+    selected = select_validation_decision_source(
+        frame,
+        protocol=PROTOCOL_NAME,
+        residual_threshold=0.5,
+        residual_threshold_policy="validation_selected",
+    )
+    assert selected.decision_source == "rule_only"
+
+    with pytest.raises(ValueError, match="validation-only"):
+        select_validation_decision_source(
+            frame,
+            protocol=PROTOCOL_NAME,
+            residual_threshold=0.5,
+            residual_threshold_policy="validation_selected",
+            split_name="test",
+        )
+
+
+def test_validation_safe_selection_enforces_minimum_gain() -> None:
+    frame = _decision_selection_frame(residual_perfect=True, rule_perfect=False)
+
+    selected = select_validation_decision_source(
+        frame,
+        protocol=PROTOCOL_NAME,
+        residual_threshold=0.5,
+        residual_threshold_policy="validation_selected",
+        minimum_gain=10.0,
+    )
+
+    assert selected.decision_source == "rule_only"
+    assert selected.table.loc[selected.table["selected"], "candidate"].item() == (
+        "rule_only"
+    )
+
+
+def test_disabled_fallback_keeps_temporal_candidate_even_when_rule_is_better() -> None:
+    frame = _decision_selection_frame(residual_perfect=False, rule_perfect=True)
+
+    selected = select_validation_decision_source(
+        frame,
+        protocol=PROTOCOL_NAME,
+        residual_threshold=0.5,
+        residual_threshold_policy="validation_selected",
+        fallback_policy="none",
+        model_candidate_name="temporal_model",
+    )
+
+    assert selected.decision_source == "temporal_model"
+    assert selected.score_col == "score"
+    assert selected.predict_col is None
+    assert selected.table.loc[selected.table["selected"], "candidate"].item() == (
+        "temporal_model"
+    )
+
+
+def test_validation_selection_never_switches_to_test_oracle() -> None:
+    validation = _decision_selection_frame(
+        residual_perfect=True, rule_perfect=False
+    )
+    test = _decision_selection_frame(residual_perfect=False, rule_perfect=True)
+    selected = select_validation_decision_source(
+        validation,
+        protocol=PROTOCOL_NAME,
+        residual_threshold=0.5,
+        residual_threshold_policy="validation_selected",
+    )
+
+    frozen_test = evaluate_frozen_decision(test, selected)
+    rule_test = evaluate_legacy_inclusive(
+        test,
+        score_col="rule_score",
+        predict_col="rule_predict",
+    )
+
+    assert selected.decision_source == "rule_guided_residual"
+    assert frozen_test.metrics["final_score"] < rule_test.metrics["final_score"]

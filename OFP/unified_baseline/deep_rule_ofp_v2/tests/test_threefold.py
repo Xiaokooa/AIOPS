@@ -178,6 +178,154 @@ def test_threefold_aggregation_recomputes_exact_pooled_metrics(tmp_path: Path) -
     assert (tmp_path / "comparison.csv").is_file()
 
 
+def test_threefold_accepts_per_fold_validation_safe_rule_sources(
+    tmp_path: Path,
+) -> None:
+    index_path = _write_complete_fixture(tmp_path)
+    expected_sources = {1: "rule_only", 2: "rule_guided_residual", 3: "rule_only"}
+    for fold, source in expected_sources.items():
+        fold_dir = tmp_path / f"fold_{fold}"
+        result_path = fold_dir / "result.csv"
+        result = pd.read_csv(result_path)
+        residual_threshold = float(result.loc[0, "decision_threshold"])
+        result.loc[0, "decision_source"] = source
+        result.loc[0, "fallback_policy"] = "validation_safe_rule"
+        if source == "rule_only":
+            result.loc[0, "decision_threshold"] = 0.5
+            result.loc[0, "threshold_policy"] = "validation_safe_rule_fallback"
+        result.to_csv(result_path, index=False)
+        pd.DataFrame(
+            [
+                {
+                    "selection_split": "validation",
+                    "candidate": "rule_only",
+                    "decision_threshold": 0.5,
+                    "selected": source == "rule_only",
+                },
+                {
+                    "selection_split": "validation",
+                    "candidate": "rule_guided_residual",
+                    "decision_threshold": residual_threshold,
+                    "selected": source == "rule_guided_residual",
+                },
+            ]
+        ).to_csv(fold_dir / "validation_decision_selection.csv", index=False)
+        legacy_selected = pd.read_csv(fold_dir / "test_module_decisions.csv")
+        legacy_selected.to_csv(
+            fold_dir
+            / (
+                "test_rule_only_module_decisions.csv"
+                if source == "rule_only"
+                else "test_residual_module_decisions.csv"
+            ),
+            index=False,
+        )
+
+        original_path = fold_dir / "result_ofp_original.csv"
+        original = pd.read_csv(original_path)
+        original.loc[0, "decision_source"] = source
+        original.loc[0, "fallback_policy"] = "validation_safe_rule"
+        if source == "rule_only":
+            original.loc[0, "threshold_policy"] = "validation_safe_rule_fallback"
+        original.to_csv(original_path, index=False)
+        pd.DataFrame(
+            [
+                {
+                    "selection_split": "validation",
+                    "candidate": "rule_only",
+                    "decision_threshold": 0.5,
+                    "selected": source == "rule_only",
+                },
+                {
+                    "selection_split": "validation",
+                    "candidate": "rule_guided_residual",
+                    "decision_threshold": 0.5,
+                    "selected": source == "rule_guided_residual",
+                },
+            ]
+        ).to_csv(
+            fold_dir / "validation_decision_selection_ofp_original.csv",
+            index=False,
+        )
+        original_selected = pd.read_csv(
+            fold_dir / "test_module_decisions_ofp_original.csv"
+        )
+        original_selected.to_csv(
+            fold_dir
+            / (
+                "test_rule_only_module_decisions_ofp_original.csv"
+                if source == "rule_only"
+                else "test_residual_module_decisions_ofp_original.csv"
+            ),
+            index=False,
+        )
+
+    comparison = aggregate_three_fold_results(
+        tmp_path, index_path, experiment_id="safe", formal=False
+    ).set_index("evaluation_protocol")
+
+    assert comparison.loc[PROTOCOL_NAME, "threshold_policy"] == (
+        "per_fold_validation_safe_rule"
+    )
+    for fold, source in expected_sources.items():
+        assert comparison.loc[
+            PROTOCOL_NAME, f"fold_{fold}_decision_source"
+        ] == source
+        assert comparison.loc[
+            OFP_ORIGINAL_PROTOCOL_NAME, f"fold_{fold}_decision_source"
+        ] == source
+
+    tampered_path = tmp_path / "fold_1" / "test_rule_only_module_decisions.csv"
+    tampered = pd.read_csv(tampered_path)
+    tampered.loc[0, "outcome"] = "TN" if tampered.loc[0, "outcome"] != "TN" else "FP"
+    tampered.to_csv(tampered_path, index=False)
+    with pytest.raises(ValueError, match="declared candidate"):
+        aggregate_three_fold_results(
+            tmp_path, index_path, experiment_id="safe_tampered", formal=False
+        )
+
+
+def test_threefold_preserves_temporal_source_when_safe_fallback_is_disabled(
+    tmp_path: Path,
+) -> None:
+    index_path = _write_complete_fixture(tmp_path)
+    for fold in (1, 2, 3):
+        for name in ("result.csv", "result_ofp_original.csv"):
+            path = tmp_path / f"fold_{fold}" / name
+            result = pd.read_csv(path)
+            result.loc[0, "decision_source"] = "temporal_model"
+            result.loc[0, "fallback_policy"] = "none"
+            result.to_csv(path, index=False)
+
+    comparison = aggregate_three_fold_results(
+        tmp_path, index_path, experiment_id="temporal", formal=False
+    )
+
+    for row in comparison.itertuples(index=False):
+        assert row.fold_1_decision_source == "temporal_model"
+        assert row.fold_2_decision_source == "temporal_model"
+        assert row.fold_3_decision_source == "temporal_model"
+
+
+def test_threefold_rejects_model_source_that_conflicts_with_architecture(
+    tmp_path: Path,
+) -> None:
+    index_path = _write_complete_fixture(tmp_path)
+    config_path = tmp_path / "fold_1" / "effective_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["model"]["architecture"] = "causal_depthwise_tcn"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    result_path = tmp_path / "fold_1" / "result.csv"
+    result = pd.read_csv(result_path)
+    result.loc[0, "decision_source"] = "rule_guided_residual"
+    result.to_csv(result_path, index=False)
+
+    with pytest.raises(ValueError, match="decision_source/model architecture mismatch"):
+        aggregate_three_fold_results(
+            tmp_path, index_path, experiment_id="mislabeled", formal=False
+        )
+
+
 def test_fold_command_is_n1_and_targets_one_outer_fold(tmp_path: Path) -> None:
     args = argparse.Namespace(
         output_dir=tmp_path / "out",

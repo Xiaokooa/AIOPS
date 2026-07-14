@@ -11,7 +11,12 @@ from fgofp.losses import (
     fgl_kl_loss,
     module_normalized_cross_entropy,
 )
-from fgofp.model import CausalSeq2SeqTCN, build_teacher_student
+from fgofp.model import (
+    CausalSeq2SeqTCN,
+    RuleGuidedResidualTCN,
+    build_teacher_student,
+)
+from fgofp.rules import RULE_FEATURE_COUNT
 
 
 def _inputs(batch: int = 2, time: int = 16):
@@ -75,6 +80,107 @@ def test_receptive_field_matches_one_conv_per_exponential_dilation():
     )
     assert model.dilations == (1, 2, 4, 8)
     assert model.receptive_field_steps == 1 + 2 * (1 + 2 + 4 + 8)
+
+
+def _rule_inputs(batch: int, time: int):
+    generator = torch.Generator().manual_seed(19)
+    margin = torch.randn(batch, time, RULE_FEATURE_COUNT, generator=generator)
+    mask = torch.ones_like(margin, dtype=torch.bool)
+    hard = (margin > 0).any(dim=-1)
+    return margin, mask, hard
+
+
+def test_zero_initialized_rule_residual_is_exact_temporal_model() -> None:
+    raw, raw_mask, delta, padding = _inputs(batch=2, time=12)
+    margin, rule_mask, hard = _rule_inputs(2, 12)
+    model = RuleGuidedResidualTCN(
+        hidden_channels=16,
+        dilation_blocks=3,
+        kernel_size=3,
+        dropout=0.0,
+        rule_hidden_channels=8,
+    ).eval()
+
+    temporal = CausalSeq2SeqTCN.forward(model, raw, raw_mask, delta, padding)
+    fused = model(
+        raw,
+        raw_mask,
+        delta,
+        padding,
+        rule_margin=margin,
+        rule_mask=rule_mask,
+        rule_hard=hard,
+    )
+
+    assert torch.equal(fused, temporal)
+
+
+def test_missing_rules_reduce_exactly_to_temporal_even_after_training_update() -> None:
+    raw, raw_mask, delta, padding = _inputs(batch=1, time=10)
+    margin, rule_mask, hard = _rule_inputs(1, 10)
+    rule_mask.zero_()
+    model = RuleGuidedResidualTCN(
+        hidden_channels=16,
+        dilation_blocks=2,
+        dropout=0.0,
+        rule_hidden_channels=8,
+    ).eval()
+    with torch.no_grad():
+        model.residual_head[-1].weight.fill_(0.25)
+        model.residual_head[-1].bias.fill_(1.0)
+
+    temporal = CausalSeq2SeqTCN.forward(model, raw, raw_mask, delta, padding)
+    fused = model(
+        raw,
+        raw_mask,
+        delta,
+        padding,
+        rule_margin=margin,
+        rule_mask=rule_mask,
+        rule_hard=hard,
+    )
+
+    assert torch.equal(fused, temporal)
+
+
+def test_future_rule_perturbation_cannot_change_past_fused_logits() -> None:
+    raw, raw_mask, delta, padding = _inputs(batch=1, time=20)
+    margin, rule_mask, hard = _rule_inputs(1, 20)
+    model = RuleGuidedResidualTCN(
+        hidden_channels=16,
+        dilation_blocks=3,
+        dropout=0.0,
+        rule_hidden_channels=8,
+    ).eval()
+    with torch.no_grad():
+        model.residual_head[-1].weight.fill_(0.05)
+    original = model(
+        raw,
+        raw_mask,
+        delta,
+        padding,
+        rule_margin=margin,
+        rule_mask=rule_mask,
+        rule_hard=hard,
+    )
+    split = 9
+    changed_margin = margin.clone()
+    changed_mask = rule_mask.clone()
+    changed_hard = hard.clone()
+    changed_margin[:, split:] *= -100.0
+    changed_mask[:, split:, :5] = False
+    changed_hard[:, split:] = ~changed_hard[:, split:]
+    changed = model(
+        raw,
+        raw_mask,
+        delta,
+        padding,
+        rule_margin=changed_margin,
+        rule_mask=changed_mask,
+        rule_hard=changed_hard,
+    )
+
+    assert torch.allclose(original[:, :split], changed[:, :split], atol=0.0, rtol=0.0)
 
 
 def test_module_normalized_ce_gives_short_and_long_modules_equal_weight():

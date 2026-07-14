@@ -41,11 +41,13 @@ class InputConfig:
 
 @dataclass
 class ModelConfig:
-    architecture: str = "causal_depthwise_tcn"
+    architecture: str = "rule_guided_residual_tcn"
     hidden_channels: int = 48
     dilation_blocks: int = 10
     kernel_size: int = 3
     dropout: float = 0.1
+    rule_hidden_channels: int = 32
+    rule_residual_scale: float = 4.0
 
 
 @dataclass
@@ -75,6 +77,9 @@ class DecisionConfig:
     threshold_grid_size: int = 201
     threshold_quantile_count: int = 201
     selection_metric: str = "final_score"
+    fallback_policy: str = "validation_safe_rule"
+    fallback_min_gain: float = 0.0
+    fallback_tie_break: str = "rule_only"
 
 
 @dataclass
@@ -129,8 +134,14 @@ class FGOFPConfig:
             raise ValueError(
                 "alignment_tolerance_seconds cannot exceed one expected cadence step"
             )
-        if self.model.architecture != "causal_depthwise_tcn":
-            raise ValueError("v2 supports only causal_depthwise_tcn")
+        if self.model.architecture not in {
+            "causal_depthwise_tcn",
+            "rule_guided_residual_tcn",
+        }:
+            raise ValueError(
+                "model.architecture must be causal_depthwise_tcn or "
+                "rule_guided_residual_tcn"
+            )
         if self.model.hidden_channels < 8:
             raise ValueError("hidden_channels must be at least 8")
         if self.model.dilation_blocks < 1:
@@ -139,6 +150,10 @@ class FGOFPConfig:
             raise ValueError("kernel_size must be at least 2")
         if not 0.0 <= self.model.dropout < 1.0:
             raise ValueError("dropout must be in [0, 1)")
+        if self.model.rule_hidden_channels < 4:
+            raise ValueError("rule_hidden_channels must be at least 4")
+        if self.model.rule_residual_scale <= 0:
+            raise ValueError("rule_residual_scale must be positive")
         if self.receptive_field_steps < self.student_horizon_steps:
             raise ValueError(
                 "model receptive field is shorter than the 120-hour native-cadence horizon"
@@ -168,6 +183,17 @@ class FGOFPConfig:
             raise ValueError("fixed_threshold must be in [0, 1]")
         if self.decision.selection_metric != "final_score":
             raise ValueError("Legacy-Inclusive threshold selection uses final_score")
+        if self.decision.fallback_policy not in {
+            "none",
+            "validation_safe_rule",
+        }:
+            raise ValueError(
+                "decision.fallback_policy must be none or validation_safe_rule"
+            )
+        if self.decision.fallback_min_gain < 0:
+            raise ValueError("decision.fallback_min_gain cannot be negative")
+        if self.decision.fallback_tie_break != "rule_only":
+            raise ValueError("the safe fallback tie break must be rule_only")
         if (
             self.decision.threshold_grid_size < 2
             or self.decision.threshold_quantile_count < 2

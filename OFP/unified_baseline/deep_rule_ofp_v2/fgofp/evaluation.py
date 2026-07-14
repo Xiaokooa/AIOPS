@@ -49,6 +49,21 @@ class ThresholdSearchResult:
     table: pd.DataFrame
 
 
+@dataclass(frozen=True)
+class DecisionSelectionResult:
+    """Validation-frozen choice between residual and deterministic RuleModel."""
+
+    protocol: str
+    decision_source: str
+    score_col: str
+    predict_col: str | None
+    threshold: float
+    threshold_policy: str
+    metrics: dict[str, Any]
+    detail: pd.DataFrame
+    table: pd.DataFrame
+
+
 def _safe_ratio(numerator: float, denominator: float) -> float:
     return float(numerator / denominator) if denominator else 0.0
 
@@ -499,6 +514,170 @@ def evaluate_ofp_original_strict(
     return LegacyEvaluationResult(metrics=metrics, detail=detail)
 
 
+def _protocol_evaluator(protocol: str):
+    if str(protocol) == PROTOCOL_NAME:
+        return evaluate_legacy_inclusive
+    if str(protocol) == OFP_ORIGINAL_PROTOCOL_NAME:
+        return evaluate_ofp_original_strict
+    raise ValueError(
+        f"unsupported evaluation protocol {protocol!r}; "
+        f"expected one of {sorted(_SUPPORTED_PROTOCOLS)}"
+    )
+
+
+def select_validation_decision_source(
+    frame: pd.DataFrame,
+    *,
+    protocol: str,
+    residual_threshold: float,
+    residual_threshold_policy: str,
+    fallback_policy: str = "validation_safe_rule",
+    minimum_gain: float = 0.0,
+    split_name: str = "validation",
+    score_col: str = "score",
+    rule_score_col: str = "rule_score",
+    rule_predict_col: str = "rule_predict",
+    model_candidate_name: str = "rule_guided_residual",
+    comparison_tolerance: float = 1e-12,
+) -> DecisionSelectionResult:
+    """Freeze one global decision source using validation labels only.
+
+    ``rule_only`` is an immutable candidate.  Under the safe policy the
+    residual model is selected only when its validation ``final_score`` is
+    strictly greater than the RuleModel score plus ``minimum_gain``.  Ties and
+    near-ties therefore fall back to RuleModel.  This is global model
+    selection, never a per-row OR and never a test-label oracle.
+    """
+
+    if str(split_name) != "validation":
+        raise ValueError("decision-source selection is validation-only")
+    if fallback_policy not in {"none", "validation_safe_rule"}:
+        raise ValueError("fallback_policy must be none or validation_safe_rule")
+    if model_candidate_name not in {"rule_guided_residual", "temporal_model"}:
+        raise ValueError(
+            "model_candidate_name must be rule_guided_residual or temporal_model"
+        )
+    if float(minimum_gain) < 0 or float(comparison_tolerance) < 0:
+        raise ValueError("minimum_gain and comparison_tolerance cannot be negative")
+    evaluator = _protocol_evaluator(protocol)
+    residual = evaluator(
+        frame,
+        threshold=float(residual_threshold),
+        score_col=score_col,
+    )
+    rule = evaluator(
+        frame,
+        threshold=0.5,
+        score_col=rule_score_col,
+        predict_col=rule_predict_col,
+    )
+    residual_score = float(residual.metrics["final_score"])
+    rule_score = float(rule.metrics["final_score"])
+    required = rule_score + float(minimum_gain) + float(comparison_tolerance)
+    residual_wins = residual_score > required
+    choose_residual = fallback_policy == "none" or residual_wins
+    selected_source = model_candidate_name if choose_residual else "rule_only"
+    selected = residual if choose_residual else rule
+    selected_threshold = float(residual_threshold) if choose_residual else 0.5
+    selected_score_col = score_col if choose_residual else rule_score_col
+    selected_predict_col = None if choose_residual else rule_predict_col
+    selected_threshold_policy = (
+        str(residual_threshold_policy)
+        if choose_residual
+        else "validation_safe_rule_fallback"
+    )
+    reason = (
+        "fallback_disabled"
+        if fallback_policy == "none"
+        else (
+            "residual_strictly_exceeds_rule_and_minimum_gain"
+            if choose_residual
+            else "rule_fallback_on_non_improvement_or_tie"
+        )
+    )
+
+    rows: list[dict[str, Any]] = []
+    candidates = (
+        (
+            model_candidate_name,
+            score_col,
+            None,
+            float(residual_threshold),
+            str(residual_threshold_policy),
+            residual,
+        ),
+        (
+            "rule_only",
+            rule_score_col,
+            rule_predict_col,
+            0.5,
+            "deterministic_canonical_legacy_38",
+            rule,
+        ),
+    )
+    for source, candidate_score, candidate_predict, threshold, policy, result in candidates:
+        candidate_metrics = dict(result.metrics)
+        candidate_metrics["decision_source"] = source
+        rows.append(
+            {
+                "selection_split": "validation",
+                "protocol": str(protocol),
+                "candidate": source,
+                "score_col": candidate_score,
+                "predict_col": candidate_predict or "",
+                "decision_threshold": float(threshold),
+                "threshold_policy": policy,
+                "fallback_policy": fallback_policy,
+                "minimum_gain": float(minimum_gain),
+                "selected": source == selected_source,
+                "selection_reason": reason if source == selected_source else "",
+                "delta_final_score_vs_rule_only": float(
+                    candidate_metrics["final_score"] - rule_score
+                ),
+                **candidate_metrics,
+            }
+        )
+    table = pd.DataFrame(rows).sort_values(
+        ["selected", "candidate"], ascending=[False, True], kind="mergesort"
+    )
+    metrics = dict(selected.metrics)
+    metrics["decision_threshold"] = selected_threshold
+    metrics["decision_source"] = selected_source
+    metrics["validation_delta_final_score_vs_rule_only"] = float(
+        residual_score - rule_score if choose_residual else 0.0
+    )
+    return DecisionSelectionResult(
+        protocol=str(protocol),
+        decision_source=selected_source,
+        score_col=selected_score_col,
+        predict_col=selected_predict_col,
+        threshold=selected_threshold,
+        threshold_policy=selected_threshold_policy,
+        metrics=metrics,
+        detail=selected.detail,
+        table=table.reset_index(drop=True),
+    )
+
+
+def evaluate_frozen_decision(
+    frame: pd.DataFrame,
+    selection: DecisionSelectionResult,
+) -> LegacyEvaluationResult:
+    """Evaluate a previously validation-frozen source without re-selection."""
+
+    evaluator = _protocol_evaluator(selection.protocol)
+    result = evaluator(
+        frame,
+        threshold=float(selection.threshold),
+        score_col=selection.score_col,
+        predict_col=selection.predict_col,
+    )
+    metrics = dict(result.metrics)
+    metrics["decision_source"] = selection.decision_source
+    metrics["decision_threshold"] = float(selection.threshold)
+    return LegacyEvaluationResult(metrics=metrics, detail=result.detail)
+
+
 def threshold_candidates(
     scores: Sequence[float],
     *,
@@ -779,14 +958,17 @@ __all__ = [
     "OFP_ORIGINAL_PROTOCOL_NAME",
     "PROTOCOL_NAME",
     "LegacyEvaluationResult",
+    "DecisionSelectionResult",
     "OFPEvaluationResult",
     "ThresholdSearchResult",
     "evaluate_legacy_inclusive",
+    "evaluate_frozen_decision",
     "evaluate_ofp_original_strict",
     "evaluate_ofp",
     "evaluate_ofp_long_frame",
     "metrics_from_module_decisions",
     "search_validation_threshold",
+    "select_validation_decision_source",
     "threshold_candidates",
     "write_module_predictions",
     "write_ofp_module_csvs",

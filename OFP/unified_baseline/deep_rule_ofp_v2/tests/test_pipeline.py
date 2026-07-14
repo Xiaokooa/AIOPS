@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 from fgofp.config import FGOFPConfig
@@ -66,6 +67,12 @@ def test_student_only_inference_returns_every_native_int64_row() -> None:
         "a.csv": 3,
         "b.csv": 5,
     }
+    assert {"score", "rule_score", "rule_predict"} <= set(frame.columns)
+    assert frame["rule_score"].between(0.0, 1.0).all()
+    assert np.array_equal(
+        frame["rule_score"].to_numpy(dtype=np.int8),
+        frame["rule_predict"].to_numpy(dtype=np.int8),
+    )
 
 
 def _write_module(path: Path, faulty: bool, first_row_fault: bool = False) -> None:
@@ -147,6 +154,10 @@ def test_tiny_end_to_end_writes_student_only_deployment_checkpoint(
         weights_only=False,
     )
     assert checkpoint["teacher_used_at_inference"] is False
+    assert checkpoint["decision_source"] in {"rule_only", "rule_guided_residual"}
+    assert checkpoint["input_schema"]["rule_schema_version"] == (
+        "canonical-legacy-38-causal-v1"
+    )
     assert checkpoint["input_config"]["expected_cadence_seconds"] == 300
     assert checkpoint["input_config"]["delta_clip_steps"] == 288.0
     assert checkpoint["task_config"]["student_horizon_hours"] == 120.0
@@ -157,10 +168,67 @@ def test_tiny_end_to_end_writes_student_only_deployment_checkpoint(
         "data_access_order"
     ].index("test_csv")
     assert manifest["deployment"]["teacher_used_at_inference"] is False
-    assert pd.read_csv(output / "result.csv").loc[0, "protocol"] == "legacy_inclusive_v1"
+    assert manifest["preview"]["label_stratified_test_subset"] is False
+    assert manifest["deployment"]["legacy_inclusive_decision"][
+        "decision_source"
+    ] in {"rule_only", "rule_guided_residual"}
+    assert (output / "validation_decision_selection.csv").is_file()
+    assert (output / "validation_decision_selection_ofp_original.csv").is_file()
+    assert (output / "test_candidate_comparison.csv").is_file()
+    assert (output / "test_rule_only_module_decisions.csv").is_file()
+    result = pd.read_csv(output / "result.csv").iloc[0]
+    assert result["protocol"] == "legacy_inclusive_v1"
+    validation_selection = pd.read_csv(
+        output / "validation_decision_selection.csv"
+    )
+    selected_validation = validation_selection.loc[
+        validation_selection["selected"].astype(bool)
+    ].iloc[0]
+    assert result["decision_source"] == selected_validation["candidate"]
+    assert result["validation_selected_final_score"] == pytest.approx(
+        selected_validation["final_score"]
+    )
+    assert (
+        float(result["validation_selected_final_score"]) + 1e-12
+        >= float(result["validation_rule_only_final_score"])
+    )
+    test_candidates = pd.read_csv(output / "test_candidate_comparison.csv")
+    selected_test = test_candidates.loc[
+        test_candidates["selected_on_validation"].astype(bool)
+    ].iloc[0]
+    assert selected_test["candidate"] == result["decision_source"]
+    assert result["final_score"] == pytest.approx(selected_test["final_score"])
+    assert result["delta_selected_final_score_vs_rule_only"] == pytest.approx(
+        result["final_score"] - result["rule_only_test_final_score"]
+    )
+    assert bool(result["test_selected_ge_rule_only"]) == (
+        result["final_score"] + 1e-12 >= result["rule_only_test_final_score"]
+    )
     original_result = pd.read_csv(output / "result_ofp_original.csv").iloc[0]
     assert original_result["protocol"] == "ofp_original_strict_v1"
     assert original_result["decision_threshold"] == 0.5
+    original_validation_selection = pd.read_csv(
+        output / "validation_decision_selection_ofp_original.csv"
+    )
+    selected_original_validation = original_validation_selection.loc[
+        original_validation_selection["selected"].astype(bool)
+    ].iloc[0]
+    assert original_result["decision_source"] == selected_original_validation[
+        "candidate"
+    ]
+    assert float(original_result["validation_selected_final_score"]) + 1e-12 >= float(
+        original_result["validation_rule_only_final_score"]
+    )
+    original_test_candidates = pd.read_csv(
+        output / "test_candidate_comparison_ofp_original.csv"
+    )
+    selected_original_test = original_test_candidates.loc[
+        original_test_candidates["selected_on_validation"].astype(bool)
+    ].iloc[0]
+    assert selected_original_test["candidate"] == original_result["decision_source"]
+    assert original_result["final_score"] == pytest.approx(
+        selected_original_test["final_score"]
+    )
     assert (output / "test_module_decisions_ofp_original.csv").is_file()
     expected_test_files = {
         row["file_name"] for row in rows if row["folder_index"] == 3

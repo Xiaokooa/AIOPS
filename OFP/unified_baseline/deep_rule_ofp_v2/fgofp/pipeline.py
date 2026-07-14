@@ -29,13 +29,16 @@ from .data import (
 from .evaluation import (
     OFP_ORIGINAL_PROTOCOL_NAME,
     PROTOCOL_NAME,
+    evaluate_frozen_decision,
     evaluate_legacy_inclusive,
     evaluate_ofp_original_strict,
     search_validation_threshold,
+    select_validation_decision_source,
     write_module_predictions,
 )
 from .features import RAW_FEATURES
-from .model import CausalSeq2SeqTCN, build_teacher_student
+from .model import build_teacher_student
+from .rules import RULE_FEATURE_COUNT, RULE_FEATURES, RULE_SCHEMA_VERSION
 from .training import TrainingResult, resolve_device, seed_everything, train_models
 
 
@@ -173,8 +176,18 @@ def _prepare_output(output_dir: Path, overwrite: bool) -> None:
             "test_scores.csv.gz",
             "training_history.csv",
             "validation_module_decisions.csv",
+            "validation_module_decisions_ofp_original.csv",
+            "validation_residual_module_decisions.csv",
+            "validation_decision_selection.csv",
+            "validation_decision_selection_ofp_original.csv",
             "validation_scores.csv.gz",
             "validation_threshold_search.csv",
+            "test_candidate_comparison.csv",
+            "test_candidate_comparison_ofp_original.csv",
+            "test_rule_only_module_decisions.csv",
+            "test_residual_module_decisions.csv",
+            "test_rule_only_module_decisions_ofp_original.csv",
+            "test_residual_module_decisions_ofp_original.csv",
         }
         for name in artifact_files:
             target = output_dir / name
@@ -212,7 +225,7 @@ def _inference_loader(
 
 @torch.no_grad()
 def infer_student(
-    student: CausalSeq2SeqTCN,
+    student: torch.nn.Module,
     dataset: NativeSequenceDataset,
     config: FGOFPConfig,
     *,
@@ -236,14 +249,31 @@ def infer_student(
         delta = batch["delta_steps"].to(
             device=device, dtype=torch.float32, non_blocking=True
         )
+        rule_margin = batch["rule_margin"].to(
+            device=device, dtype=torch.float32, non_blocking=True
+        )
+        rule_mask = batch["rule_mask"].to(
+            device=device, dtype=torch.bool, non_blocking=True
+        )
+        rule_hard = batch["rule_hard"].to(
+            device=device, dtype=torch.bool, non_blocking=True
+        )
         lengths = batch["lengths"].to(dtype=torch.long)
         maximum = int(raw.shape[1])
         padding_mask = (
             torch.arange(maximum, device=device).unsqueeze(0)
             < lengths.to(device=device).unsqueeze(1)
         )
-        logits = student(raw, raw_mask, delta, padding_mask)
+        forward_kwargs: dict[str, Any] = {}
+        if bool(getattr(student, "requires_rule_inputs", False)):
+            forward_kwargs = {
+                "rule_margin": rule_margin,
+                "rule_mask": rule_mask,
+                "rule_hard": rule_hard,
+            }
+        logits = student(raw, raw_mask, delta, padding_mask, **forward_kwargs)
         scores = torch.softmax(logits.float(), dim=-1)[..., 1].cpu().numpy()
+        hard_predictions = rule_hard.cpu().numpy()
         timestamps = batch["timestamps"].cpu().numpy()
         anomaly = batch["anomaly"].cpu().numpy()
         for index, file_name in enumerate(batch["file_names"]):
@@ -255,6 +285,12 @@ def infer_student(
                         "timestamp": timestamps[index, :length].astype(np.int64),
                         "anomaly": (anomaly[index, :length] > 0).astype(np.int8),
                         "score": scores[index, :length].astype(np.float32),
+                        "rule_score": hard_predictions[index, :length].astype(
+                            np.float32
+                        ),
+                        "rule_predict": hard_predictions[index, :length].astype(
+                            np.int8
+                        ),
                     }
                 )
             )
@@ -288,6 +324,39 @@ def _split_table(split: SplitManifest) -> pd.DataFrame:
     )
 
 
+def _test_candidate_table(
+    *,
+    protocol: str,
+    selected_source: str,
+    model_source: str,
+    residual_result: Any,
+    rule_result: Any,
+) -> pd.DataFrame:
+    """Audit both frozen candidates after test selection is already fixed."""
+
+    rule_final = float(rule_result.metrics["final_score"])
+    rows: list[dict[str, Any]] = []
+    for source, result in (
+        (model_source, residual_result),
+        ("rule_only", rule_result),
+    ):
+        metrics = {name: _scalar(value) for name, value in result.metrics.items()}
+        metrics["decision_source"] = source
+        rows.append(
+            {
+                "evaluation_split": "test",
+                "protocol": protocol,
+                "candidate": source,
+                "selected_on_validation": source == selected_source,
+                "delta_final_score_vs_rule_only": float(
+                    metrics["final_score"] - rule_final
+                ),
+                **metrics,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def run_experiment(
     config: FGOFPConfig,
     data_dir: Path | str,
@@ -310,14 +379,18 @@ def run_experiment(
     if config.protocol.name != PROTOCOL_NAME:
         raise ValueError(f"pipeline supports only {PROTOCOL_NAME}")
 
-    split = build_fixed_split(
+    full_split = build_fixed_split(
         index_path,
         validation_fraction=config.split.validation_fraction,
         seed=config.split.seed,
         test_fold=config.split.test_fold,
     )
+    preview_label_stratified_test_subset = bool(
+        max_test_modules is not None
+        and int(max_test_modules) < len(full_split.test)
+    )
     split = _limited_manifest(
-        split,
+        full_split,
         max_train_modules=max_train_modules,
         max_validation_modules=max_validation_modules,
         max_test_modules=max_test_modules,
@@ -412,32 +485,83 @@ def run_experiment(
             quantile_count=config.decision.threshold_quantile_count,
             split_name="validation",
         )
-        threshold = float(threshold_search.threshold)
+        residual_threshold = float(threshold_search.threshold)
         threshold_search.table.to_csv(
             output_dir / "validation_threshold_search.csv", index=False
         )
-        threshold_search.detail.to_csv(
-            output_dir / "validation_module_decisions.csv", index=False
+        residual_validation_result = evaluate_legacy_inclusive(
+            validation_frame, threshold=residual_threshold
         )
-        threshold_policy = "validation_selected"
+        residual_threshold_policy = "validation_selected"
     else:
-        threshold = float(config.decision.fixed_threshold)
-        validation_result = evaluate_legacy_inclusive(
-            validation_frame, threshold=threshold
-        )
-        validation_result.detail.to_csv(
-            output_dir / "validation_module_decisions.csv", index=False
+        residual_threshold = float(config.decision.fixed_threshold)
+        residual_validation_result = evaluate_legacy_inclusive(
+            validation_frame, threshold=residual_threshold
         )
         pd.DataFrame(
-            [{"rank": 1, "selected": True, "threshold": threshold, **validation_result.metrics}]
+            [
+                {
+                    "rank": 1,
+                    "selected": True,
+                    "selection_split": "validation",
+                    "threshold": residual_threshold,
+                    **residual_validation_result.metrics,
+                }
+            ]
         ).to_csv(output_dir / "validation_threshold_search.csv", index=False)
-        threshold_policy = "fixed"
+        residual_threshold_policy = "fixed"
+    residual_validation_result.detail.to_csv(
+        output_dir / "validation_residual_module_decisions.csv", index=False
+    )
+
+    model_candidate_name = (
+        "rule_guided_residual"
+        if config.model.architecture == "rule_guided_residual_tcn"
+        else "temporal_model"
+    )
+    legacy_selection = select_validation_decision_source(
+        validation_frame,
+        protocol=PROTOCOL_NAME,
+        residual_threshold=residual_threshold,
+        residual_threshold_policy=residual_threshold_policy,
+        fallback_policy=config.decision.fallback_policy,
+        minimum_gain=config.decision.fallback_min_gain,
+        split_name="validation",
+        model_candidate_name=model_candidate_name,
+    )
+    original_selection = select_validation_decision_source(
+        validation_frame,
+        protocol=OFP_ORIGINAL_PROTOCOL_NAME,
+        residual_threshold=0.5,
+        residual_threshold_policy="fixed_0.5_model1_ofp_compatibility",
+        fallback_policy=config.decision.fallback_policy,
+        minimum_gain=config.decision.fallback_min_gain,
+        split_name="validation",
+        model_candidate_name=model_candidate_name,
+    )
+    legacy_selection.table.to_csv(
+        output_dir / "validation_decision_selection.csv", index=False
+    )
+    original_selection.table.to_csv(
+        output_dir / "validation_decision_selection_ofp_original.csv", index=False
+    )
+    legacy_selection.detail.to_csv(
+        output_dir / "validation_module_decisions.csv", index=False
+    )
+    original_selection.detail.to_csv(
+        output_dir / "validation_module_decisions_ofp_original.csv", index=False
+    )
+    threshold = float(legacy_selection.threshold)
+    threshold_policy = legacy_selection.threshold_policy
     if save_long_scores:
         validation_frame.to_csv(
             output_dir / "validation_scores.csv.gz", index=False, compression="gzip"
         )
     print(
-        f"[decision] validation threshold frozen at {threshold:.9f}; "
+        "[decision] validation sources frozen: "
+        f"legacy={legacy_selection.decision_source} "
+        f"(threshold={legacy_selection.threshold:.9f}), "
+        f"ofp_original={original_selection.decision_source}; "
         f"fold-{config.split.test_fold} CSV loading may now begin",
         flush=True,
     )
@@ -456,12 +580,29 @@ def run_experiment(
         "task_config": config.to_dict()["task"],
         "input_schema": {
             "raw_features": list(RAW_FEATURES),
-            "channels": ["raw", "raw_observation_mask", "delta_steps"],
+            "rule_schema_version": RULE_SCHEMA_VERSION,
+            "rule_features": list(RULE_FEATURES),
+            "channels": [
+                "raw",
+                "raw_observation_mask",
+                "delta_steps",
+                "rule_margin",
+                "rule_validity_mask",
+                "rule_hard_or",
+            ],
             "cadence_mode": config.inputs.cadence_mode,
         },
         "standardizer": standardizer.to_dict(),
         "decision_threshold": threshold,
         "threshold_policy": threshold_policy,
+        "decision_source": legacy_selection.decision_source,
+        "residual_validation_threshold": residual_threshold,
+        "fallback_policy": config.decision.fallback_policy,
+        "ofp_original_decision": {
+            "decision_source": original_selection.decision_source,
+            "decision_threshold": original_selection.threshold,
+            "threshold_policy": original_selection.threshold_policy,
+        },
         "protocol": config.to_dict()["protocol"],
         "teacher_used_at_inference": False,
     }
@@ -518,28 +659,75 @@ def run_experiment(
     test_frame = infer_student(
         training.student, test_dataset, config, progress_label="test"
     )
-    test_result = evaluate_legacy_inclusive(test_frame, threshold=threshold)
+    test_result = evaluate_frozen_decision(test_frame, legacy_selection)
     test_result.detail.to_csv(output_dir / "test_module_decisions.csv", index=False)
-    # This secondary row freezes the root OFP/EvaluateResult.py semantics for
-    # historical Model1 comparison.  It does not replace the paper's primary
-    # Legacy-Inclusive protocol and never changes the trained model.
-    ofp_original_threshold = 0.5
-    ofp_original_result = evaluate_ofp_original_strict(
-        test_frame, threshold=ofp_original_threshold
+    legacy_residual_result = evaluate_legacy_inclusive(
+        test_frame, threshold=residual_threshold
+    )
+    legacy_rule_result = evaluate_legacy_inclusive(
+        test_frame,
+        threshold=0.5,
+        score_col="rule_score",
+        predict_col="rule_predict",
+    )
+    legacy_residual_result.detail.to_csv(
+        output_dir / "test_residual_module_decisions.csv", index=False
+    )
+    legacy_rule_result.detail.to_csv(
+        output_dir / "test_rule_only_module_decisions.csv", index=False
+    )
+    _test_candidate_table(
+        protocol=PROTOCOL_NAME,
+        selected_source=legacy_selection.decision_source,
+        model_source=model_candidate_name,
+        residual_result=legacy_residual_result,
+        rule_result=legacy_rule_result,
+    ).to_csv(output_dir / "test_candidate_comparison.csv", index=False)
+
+    # Historical Model1 comparison uses the strict evaluator, but its branch
+    # source is independently frozen on validation before this test is opened.
+    ofp_original_result = evaluate_frozen_decision(test_frame, original_selection)
+    original_residual_result = evaluate_ofp_original_strict(
+        test_frame, threshold=0.5
+    )
+    original_rule_result = evaluate_ofp_original_strict(
+        test_frame,
+        threshold=0.5,
+        score_col="rule_score",
+        predict_col="rule_predict",
     )
     ofp_original_result.detail.to_csv(
         output_dir / "test_module_decisions_ofp_original.csv", index=False
     )
+    original_residual_result.detail.to_csv(
+        output_dir / "test_residual_module_decisions_ofp_original.csv", index=False
+    )
+    original_rule_result.detail.to_csv(
+        output_dir / "test_rule_only_module_decisions_ofp_original.csv", index=False
+    )
+    _test_candidate_table(
+        protocol=OFP_ORIGINAL_PROTOCOL_NAME,
+        selected_source=original_selection.decision_source,
+        model_source=model_candidate_name,
+        residual_result=original_residual_result,
+        rule_result=original_rule_result,
+    ).to_csv(
+        output_dir / "test_candidate_comparison_ofp_original.csv", index=False
+    )
     write_module_predictions(
         test_frame,
         output_dir / "ofp_predictions",
-        threshold=threshold,
+        threshold=legacy_selection.threshold,
+        score_col=legacy_selection.score_col,
+        predict_col=legacy_selection.predict_col,
         overwrite=True,
     )
     write_module_predictions(
         test_frame,
         output_dir / "ofp_predictions_original_fixed_0.5",
-        threshold=ofp_original_threshold,
+        threshold=original_selection.threshold,
+        score_col=original_selection.score_col,
+        predict_col=original_selection.predict_col,
         overwrite=True,
     )
     if save_long_scores:
@@ -547,22 +735,53 @@ def run_experiment(
             output_dir / "test_scores.csv.gz", index=False, compression="gzip"
         )
 
-    variant = (
+    objective_variant = (
         "native_s2s_ce"
         if config.training.fgl_alpha >= 1.0
         else "native_s2s_ce_fgl"
     )
+    fallback_variant = (
+        "safe_rule"
+        if config.decision.fallback_policy == "validation_safe_rule"
+        else "no_rule_fallback"
+    )
+    variant = f"{objective_variant}_{config.model.architecture}_{fallback_variant}"
+    uses_rule_guidance = config.model.architecture == "rule_guided_residual_tcn"
+    uses_safe_fallback = (
+        config.decision.fallback_policy == "validation_safe_rule"
+    )
+    if uses_rule_guidance and uses_safe_fallback:
+        changed_axis = "architecture_and_decision_policy"
+    elif uses_rule_guidance:
+        changed_axis = "architecture"
+    elif uses_safe_fallback:
+        changed_axis = "decision_policy"
+    else:
+        changed_axis = "training_objective"
     metrics = {name: _scalar(value) for name, value in test_result.metrics.items()}
     result_row: dict[str, Any] = {
         "experiment_id": config.experiment_name,
         "variant": variant,
-        "changed_axis": "training_objective",
+        "changed_axis": changed_axis,
         "test_fold": int(config.split.test_fold),
         "protocol": PROTOCOL_NAME,
         "native_rows": True,
         "sequence_to_sequence": True,
         "teacher_used_at_inference": False,
-        "decision_feature_count": 2 * len(RAW_FEATURES) + 1,
+        "decision_feature_count": (
+            2 * len(RAW_FEATURES)
+            + 1
+            + (
+                2 * RULE_FEATURE_COUNT + 1
+                if config.model.architecture == "rule_guided_residual_tcn"
+                else 0
+            )
+        ),
+        "rule_candidate_feature_count": RULE_FEATURE_COUNT,
+        "model_architecture": config.model.architecture,
+        "preview_label_stratified_test_subset": (
+            preview_label_stratified_test_subset
+        ),
         "student_parameters": _parameter_count(training.student),
         "teacher_training_parameters": (
             _parameter_count(training.teacher_train_only)
@@ -584,6 +803,38 @@ def run_experiment(
         "fgl_coverage_scale": training.fgl_coverage_scale,
         "decision_threshold": threshold,
         "threshold_policy": threshold_policy,
+        "decision_source": legacy_selection.decision_source,
+        "residual_validation_threshold": residual_threshold,
+        "fallback_policy": config.decision.fallback_policy,
+        "fallback_minimum_gain": config.decision.fallback_min_gain,
+        "validation_rule_only_final_score": float(
+            legacy_selection.table.set_index("candidate").loc[
+                "rule_only", "final_score"
+            ]
+        ),
+        "validation_residual_final_score": float(
+            legacy_selection.table.set_index("candidate").loc[
+                model_candidate_name, "final_score"
+            ]
+        ),
+        "validation_selected_final_score": float(
+            legacy_selection.metrics["final_score"]
+        ),
+        "rule_only_test_final_score": float(
+            legacy_rule_result.metrics["final_score"]
+        ),
+        "residual_test_final_score": float(
+            legacy_residual_result.metrics["final_score"]
+        ),
+        "delta_selected_final_score_vs_rule_only": float(
+            test_result.metrics["final_score"]
+            - legacy_rule_result.metrics["final_score"]
+        ),
+        "test_selected_ge_rule_only": bool(
+            float(test_result.metrics["final_score"])
+            + 1e-12
+            >= float(legacy_rule_result.metrics["final_score"])
+        ),
         "seconds_total": float(time.perf_counter() - started),
         **metrics,
     }
@@ -600,8 +851,40 @@ def run_experiment(
                 "test_fold": int(config.split.test_fold),
                 "training_protocol": PROTOCOL_NAME,
                 "protocol": OFP_ORIGINAL_PROTOCOL_NAME,
-                "decision_threshold": ofp_original_threshold,
-                "threshold_policy": "fixed_0.5_model1_ofp_compatibility",
+                "decision_threshold": original_selection.threshold,
+                "threshold_policy": original_selection.threshold_policy,
+                "decision_source": original_selection.decision_source,
+                "residual_validation_threshold": 0.5,
+                "fallback_policy": config.decision.fallback_policy,
+                "fallback_minimum_gain": config.decision.fallback_min_gain,
+                "validation_rule_only_final_score": float(
+                    original_selection.table.set_index("candidate").loc[
+                        "rule_only", "final_score"
+                    ]
+                ),
+                "validation_residual_final_score": float(
+                    original_selection.table.set_index("candidate").loc[
+                        model_candidate_name, "final_score"
+                    ]
+                ),
+                "validation_selected_final_score": float(
+                    original_selection.metrics["final_score"]
+                ),
+                "rule_only_test_final_score": float(
+                    original_rule_result.metrics["final_score"]
+                ),
+                "residual_test_final_score": float(
+                    original_residual_result.metrics["final_score"]
+                ),
+                "delta_selected_final_score_vs_rule_only": float(
+                    ofp_original_result.metrics["final_score"]
+                    - original_rule_result.metrics["final_score"]
+                ),
+                "test_selected_ge_rule_only": bool(
+                    float(ofp_original_result.metrics["final_score"])
+                    + 1e-12
+                    >= float(original_rule_result.metrics["final_score"])
+                ),
                 "seconds_total": float(time.perf_counter() - started),
                 **ofp_original_metrics,
             }
@@ -621,6 +904,14 @@ def run_experiment(
             "validation": len(split.validation),
             "test": len(split.test),
         },
+        "preview": {
+            "label_stratified_test_subset": (
+                preview_label_stratified_test_subset
+            ),
+            "full_outer_test_module_count": len(full_split.test),
+            "evaluated_test_module_count": len(split.test),
+            "formal_result_allowed": not preview_label_stratified_test_subset,
+        },
         "protocol": {
             "name": PROTOCOL_NAME,
             "hit_condition": "first_alarm_timestamp <= first_failure_timestamp",
@@ -637,10 +928,20 @@ def run_experiment(
             "raw_features": list(RAW_FEATURES),
             "mask_feature_count": len(RAW_FEATURES),
             "delta_feature_count": 1,
+            "rule_schema_version": RULE_SCHEMA_VERSION,
+            "rule_feature_count": RULE_FEATURE_COUNT,
+            "rule_features": list(RULE_FEATURES),
+            "rule_inputs": ["signed_margin", "validity_mask", "hard_or"],
+            "rule_margin_cache_dtype": "float16",
+            "rule_hard_decision_quantized_from_margin": False,
+            "model_rule_inputs_enabled": (
+                config.model.architecture == "rule_guided_residual_tcn"
+            ),
             "resampling": False,
             "aggregation": False,
         },
         "training": {
+            "model_architecture": config.model.architecture,
             "objective": (
                 "future_window_cross_entropy"
                 if config.training.fgl_alpha >= 1.0
@@ -661,20 +962,43 @@ def run_experiment(
             "checkpoint": "checkpoints/student_best.pt",
             "teacher_used_at_inference": False,
             "teacher_parameters_in_student_checkpoint": False,
+            "fallback_policy": config.decision.fallback_policy,
+            "fallback_minimum_gain": config.decision.fallback_min_gain,
+            "legacy_inclusive_decision": {
+                "decision_source": legacy_selection.decision_source,
+                "decision_threshold": legacy_selection.threshold,
+                "threshold_policy": legacy_selection.threshold_policy,
+                "validation_selected": True,
+            },
+            "ofp_original_decision": {
+                "decision_source": original_selection.decision_source,
+                "decision_threshold": original_selection.threshold,
+                "threshold_policy": original_selection.threshold_policy,
+                "validation_selected": True,
+            },
+            "guarantee_boundary": (
+                "The selected validation score is not lower than RuleModel under "
+                "validation_safe_rule. Unknown-test metrics cannot be guaranteed "
+                "without using test labels."
+            ),
         },
         "data_access_order": [
             "index_membership",
             "train_csv",
             "validation_csv",
+            "validation_model_threshold_selected",
             "validation_threshold_frozen",
+            "validation_decision_sources_frozen",
             "test_csv",
         ],
         "primary_metrics": metrics,
         "ofp_original_compatibility": {
             "protocol": OFP_ORIGINAL_PROTOCOL_NAME,
             "hit_condition": "first_alarm_timestamp < first_failure_timestamp",
-            "decision_threshold": ofp_original_threshold,
-            "threshold_policy": "fixed_0.5_model1_ofp_compatibility",
+            "decision_threshold": original_selection.threshold,
+            "threshold_policy": original_selection.threshold_policy,
+            "decision_source": original_selection.decision_source,
+            "residual_threshold": 0.5,
             "lead_denominator": "all_faulty_modules",
             "metrics": ofp_original_metrics,
             "historical_reference_warning": (
@@ -700,7 +1024,8 @@ def run_experiment(
     _write_json(output_dir / "normalizer.json", standardizer.to_dict())
     _write_json(output_dir / "run_manifest.json", manifest)
     print(
-        f"[result] threshold={threshold:.9f} "
+        f"[result] source={legacy_selection.decision_source} "
+        f"threshold={threshold:.9f} "
         f"final={float(metrics['final_score']):.6f} "
         f"F1={float(metrics['f1_score']):.6f}",
         flush=True,

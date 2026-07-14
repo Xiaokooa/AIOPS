@@ -29,6 +29,7 @@ EXPECTED_FULL_NORMAL = 9_270
 OFP_ORIGINAL_THRESHOLD = 0.5
 OFP_ORIGINAL_THRESHOLD_POLICY = "fixed_0.5_model1_ofp_compatibility"
 LEGACY_THRESHOLD_POLICY = "validation_selected"
+SAFE_RULE_THRESHOLD_POLICY = "validation_safe_rule_fallback"
 _AUDITED_METRICS = (
     "final_score",
     "f1_score",
@@ -81,7 +82,52 @@ def _normalized_fold_config(path: Path) -> dict[str, Any]:
     return config
 
 
+def _validate_decision_source_architecture(
+    result: Mapping[str, Any],
+    config: Mapping[str, Any],
+    *,
+    source: Path,
+) -> None:
+    """Ensure a non-fallback source names the model that was actually built."""
+
+    if "decision_source" not in result:
+        return
+    architecture = str(config.get("model", {}).get("architecture", ""))
+    expected_by_architecture = {
+        "causal_depthwise_tcn": "temporal_model",
+        "rule_guided_residual_tcn": "rule_guided_residual",
+    }
+    expected = expected_by_architecture.get(architecture)
+    decision_source = str(result["decision_source"])
+    if expected is not None and decision_source not in {expected, "rule_only"}:
+        raise ValueError(
+            f"decision_source/model architecture mismatch in {source}: "
+            f"architecture={architecture!r}, source={decision_source!r}"
+        )
+
+
 def _validate_threshold_provenance(fold_dir: Path, result: Mapping[str, Any]) -> None:
+    source = str(result.get("decision_source", "rule_guided_residual"))
+    selection_path = fold_dir / "validation_decision_selection.csv"
+    if selection_path.is_file():
+        selection = pd.read_csv(selection_path)
+        if "selected" not in selection or "selection_split" not in selection:
+            raise ValueError(f"decision selection audit columns missing in {fold_dir}")
+        chosen = selection.loc[_selected_mask(selection["selected"])]
+        if len(chosen) != 1 or str(chosen.iloc[0]["selection_split"]) != "validation":
+            raise ValueError(f"invalid validation decision selection in {fold_dir}")
+        row = chosen.iloc[0]
+        if str(row["candidate"]) != source:
+            raise ValueError(f"selected decision source/result mismatch in {fold_dir}")
+        if not np.isclose(
+            float(row["decision_threshold"]),
+            float(result["decision_threshold"]),
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError(f"selected decision threshold/result mismatch in {fold_dir}")
+        if source == "rule_only":
+            return
     table = pd.read_csv(fold_dir / "validation_threshold_search.csv")
     if "selected" not in table or "selection_split" not in table:
         raise ValueError(f"threshold audit columns missing in {fold_dir}")
@@ -106,14 +152,19 @@ def _validate_result_identity(
     source: Path,
     fold: int,
     protocol: str,
-    threshold_policy: str,
+    threshold_policy: str | tuple[str, ...],
     threshold: float | None = None,
 ) -> None:
     if int(result.get("test_fold", -1)) != int(fold):
         raise ValueError(f"result/test_fold mismatch in {source}")
     if str(result.get("protocol", "")) != protocol:
         raise ValueError(f"result/protocol mismatch in {source}")
-    if str(result.get("threshold_policy", "")) != threshold_policy:
+    expected_policies = (
+        (threshold_policy,)
+        if isinstance(threshold_policy, str)
+        else tuple(threshold_policy)
+    )
+    if str(result.get("threshold_policy", "")) not in expected_policies:
         raise ValueError(f"result/threshold_policy mismatch in {source}")
     if threshold is not None and not np.isclose(
         float(result.get("decision_threshold", np.nan)),
@@ -169,6 +220,38 @@ def _validate_detail_names(
         )
 
 
+def _validate_selected_detail_matches_candidate(
+    selected: pd.DataFrame,
+    candidate_path: Path,
+    *,
+    source: Path,
+) -> None:
+    """Prevent a declared decision source from pooling another branch's rows."""
+
+    if not candidate_path.is_file():
+        raise ValueError(f"selected candidate detail missing: {candidate_path}")
+    candidate = pd.read_csv(candidate_path)
+    if set(selected.columns) != set(candidate.columns):
+        raise ValueError(f"selected/candidate detail columns differ in {source}")
+    left = selected.sort_values("file_name", kind="mergesort").reset_index(drop=True)
+    right = candidate.loc[:, left.columns].sort_values(
+        "file_name", kind="mergesort"
+    ).reset_index(drop=True)
+    try:
+        pd.testing.assert_frame_equal(
+            left,
+            right,
+            check_dtype=False,
+            check_exact=False,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+    except AssertionError as error:
+        raise ValueError(
+            f"selected module decisions do not match declared candidate in {source}"
+        ) from error
+
+
 def _common_result_fields(fold_results: pd.DataFrame) -> dict[str, Any]:
     fields = (
         "variant",
@@ -198,8 +281,26 @@ def _comparison_row(
     fold_results: pd.DataFrame,
     thresholds: Mapping[int, float],
     formal: bool,
+    decision_rows: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     original = protocol == OFP_ORIGINAL_PROTOCOL_NAME
+    decision_frame = fold_results if decision_rows is None else decision_rows
+    safe_sources = {"rule_guided_residual", "temporal_model", "rule_only"}
+    has_declared_sources = (
+        "decision_source" in decision_frame.columns
+        and set(decision_frame["decision_source"].astype(str)) <= safe_sources
+    )
+    safe_selection = (
+        has_declared_sources
+        and "fallback_policy" in decision_frame.columns
+        and set(decision_frame["fallback_policy"].astype(str))
+        == {"validation_safe_rule"}
+    )
+    sources = (
+        decision_frame.set_index("outer_fold")["decision_source"].astype(str).to_dict()
+        if has_declared_sources
+        else {fold: "rule_guided_residual" for fold in OUTER_FOLDS}
+    )
     row: dict[str, Any] = {
         "experiment_id": experiment_id,
         "variant": "native_s2s_ce_fgl_3fold_pooled",
@@ -211,13 +312,20 @@ def _comparison_row(
         "formal_full_oof": bool(formal),
         "decision_threshold": 0.5 if original else np.nan,
         "threshold_policy": (
-            "fixed_0.5_model1_ofp_compatibility"
-            if original
-            else "per_fold_validation_selected"
+            "per_fold_validation_safe_rule"
+            if safe_selection
+            else (
+                "fixed_0.5_model1_ofp_compatibility"
+                if original
+                else "per_fold_validation_selected"
+            )
         ),
         "fold_1_threshold": 0.5 if original else thresholds[1],
         "fold_2_threshold": 0.5 if original else thresholds[2],
         "fold_3_threshold": 0.5 if original else thresholds[3],
+        "fold_1_decision_source": sources[1],
+        "fold_2_decision_source": sources[2],
+        "fold_3_decision_source": sources[3],
         "seconds_total": float(
             pd.to_numeric(fold_results["seconds_total"], errors="raise").sum()
         ),
@@ -261,6 +369,9 @@ def aggregate_three_fold_results(
 
     for fold in OUTER_FOLDS:
         fold_dir = output_dir / f"fold_{fold}"
+        fold_config = _normalized_fold_config(
+            fold_dir / "effective_config.json"
+        )
         expected = set(
             index.loc[index["folder_index"] == fold, "file_name"].astype(str)
         )
@@ -272,12 +383,19 @@ def aggregate_three_fold_results(
 
         result_path = fold_dir / "result.csv"
         result = _one_row(result_path)
+        _validate_decision_source_architecture(
+            result, fold_config, source=result_path
+        )
         _validate_result_identity(
             result,
             source=result_path,
             fold=fold,
             protocol=PROTOCOL_NAME,
-            threshold_policy=LEGACY_THRESHOLD_POLICY,
+            threshold_policy=(
+                LEGACY_THRESHOLD_POLICY,
+                "fixed",
+                SAFE_RULE_THRESHOLD_POLICY,
+            ),
         )
         _validate_threshold_provenance(fold_dir, result)
         thresholds[fold] = float(result["decision_threshold"])
@@ -286,20 +404,79 @@ def aggregate_three_fold_results(
 
         original_result_path = fold_dir / "result_ofp_original.csv"
         original_result = _one_row(original_result_path)
+        _validate_decision_source_architecture(
+            original_result, fold_config, source=original_result_path
+        )
         _validate_result_identity(
             original_result,
             source=original_result_path,
             fold=fold,
             protocol=OFP_ORIGINAL_PROTOCOL_NAME,
-            threshold_policy=OFP_ORIGINAL_THRESHOLD_POLICY,
+            threshold_policy=(
+                OFP_ORIGINAL_THRESHOLD_POLICY,
+                SAFE_RULE_THRESHOLD_POLICY,
+            ),
             threshold=OFP_ORIGINAL_THRESHOLD,
         )
+        original_selection_path = (
+            fold_dir / "validation_decision_selection_ofp_original.csv"
+        )
+        if original_selection_path.is_file():
+            selection = pd.read_csv(original_selection_path)
+            selected = selection.loc[_selected_mask(selection["selected"])]
+            if len(selected) != 1:
+                raise ValueError(
+                    f"expected one selected original decision in {fold_dir}"
+                )
+            selected_row = selected.iloc[0]
+            source = str(
+                original_result.get("decision_source", "rule_guided_residual")
+            )
+            if (
+                str(selected_row["selection_split"]) != "validation"
+                or str(selected_row["candidate"]) != source
+                or not np.isclose(
+                    float(selected_row["decision_threshold"]),
+                    float(original_result["decision_threshold"]),
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+            ):
+                raise ValueError(
+                    f"original decision selection/result mismatch in {fold_dir}"
+                )
         original_result["outer_fold"] = fold
 
         legacy_path = fold_dir / "test_module_decisions.csv"
         legacy = pd.read_csv(legacy_path)
         original_path = fold_dir / "test_module_decisions_ofp_original.csv"
         original = pd.read_csv(original_path)
+        if (fold_dir / "validation_decision_selection.csv").is_file():
+            legacy_source = str(
+                result.get("decision_source", "rule_guided_residual")
+            )
+            legacy_candidate = fold_dir / (
+                "test_rule_only_module_decisions.csv"
+                if legacy_source == "rule_only"
+                else "test_residual_module_decisions.csv"
+            )
+            _validate_selected_detail_matches_candidate(
+                legacy, legacy_candidate, source=legacy_path
+            )
+        if (
+            fold_dir / "validation_decision_selection_ofp_original.csv"
+        ).is_file():
+            original_source = str(
+                original_result.get("decision_source", "rule_guided_residual")
+            )
+            original_candidate = fold_dir / (
+                "test_rule_only_module_decisions_ofp_original.csv"
+                if original_source == "rule_only"
+                else "test_residual_module_decisions_ofp_original.csv"
+            )
+            _validate_selected_detail_matches_candidate(
+                original, original_candidate, source=original_path
+            )
         expected_for_run = expected if formal else split_names
         _validate_detail_names(legacy, expected_for_run, source=legacy_path)
         _validate_detail_names(original, expected_for_run, source=original_path)
@@ -320,9 +497,7 @@ def aggregate_three_fold_results(
         original.insert(0, "outer_fold", fold)
         legacy_details.append(legacy)
         original_details.append(original)
-        normalized_configs.append(
-            _normalized_fold_config(fold_dir / "effective_config.json")
-        )
+        normalized_configs.append(fold_config)
 
     if any(config != normalized_configs[0] for config in normalized_configs[1:]):
         raise ValueError("fold configurations differ beyond test_fold/experiment_name")
@@ -373,6 +548,7 @@ def aggregate_three_fold_results(
                 fold_results=fold_results,
                 thresholds=thresholds,
                 formal=formal,
+                decision_rows=original_fold_results,
             ),
         ]
     )
@@ -403,6 +579,24 @@ def aggregate_three_fold_results(
         "faulty_module_count": int(legacy_metrics["faulty_module_count"]),
         "normal_module_count": int(legacy_metrics["normal_module_count"]),
         "threshold_by_fold": {str(key): value for key, value in thresholds.items()},
+        "decision_source_by_fold": {
+            str(int(row.outer_fold)): str(
+                getattr(row, "decision_source", "rule_guided_residual")
+                if getattr(row, "decision_source", "rule_guided_residual")
+                in {"rule_guided_residual", "temporal_model", "rule_only"}
+                else "rule_guided_residual"
+            )
+            for row in fold_results.itertuples(index=False)
+        },
+        "ofp_original_decision_source_by_fold": {
+            str(int(row.outer_fold)): str(
+                getattr(row, "decision_source", "rule_guided_residual")
+                if getattr(row, "decision_source", "rule_guided_residual")
+                in {"rule_guided_residual", "temporal_model", "rule_only"}
+                else "rule_guided_residual"
+            )
+            for row in original_fold_results.itertuples(index=False)
+        },
         "legacy_inclusive_result": dict(legacy_metrics),
         "ofp_original_compatibility_result": dict(original_metrics),
         "aggregation": "concatenate_oof_module_decisions_then_recompute",

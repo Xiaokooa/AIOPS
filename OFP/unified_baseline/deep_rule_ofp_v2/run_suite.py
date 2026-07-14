@@ -11,9 +11,14 @@ import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = BASE_DIR.parents[2]
+TEMPORAL_CONTROL_FLAGS = [
+    "--architecture",
+    "causal_depthwise_tcn",
+    "--disable-safe-rule-fallback",
+]
 EXPERIMENTS = {
-    "N0_native_s2s_ce": ["--disable-fgl"],
-    "N1_native_s2s_ce_fgl": [],
+    "N0_native_s2s_ce": [*TEMPORAL_CONTROL_FLAGS, "--disable-fgl"],
+    "N1_native_s2s_ce_fgl": [*TEMPORAL_CONTROL_FLAGS],
 }
 
 

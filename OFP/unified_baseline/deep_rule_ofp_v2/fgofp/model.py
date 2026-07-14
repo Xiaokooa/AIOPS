@@ -3,8 +3,10 @@
 The model deliberately keeps the temporal contract small and auditable:
 
 * every output row is computed from that row and earlier rows only;
-* the 12 raw measurements, their observation masks, and one delta-time channel
-  are the only inputs;
+* the temporal trunk consumes the 12 raw measurements, their observation
+  masks, and one delta-time channel;
+* the optional rule adapter applies a bounded pointwise residual to temporal
+  logits using only causal signed rule margins;
 * padding is explicitly zeroed after every residual block; and
 * normalization is per time point (``LayerNorm``), never across time or across
   modules in a batch.
@@ -20,6 +22,8 @@ from typing import Any, Tuple
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+
+from .rules import RULE_FEATURE_COUNT
 
 
 RAW_FEATURE_COUNT = 12
@@ -153,6 +157,8 @@ class CausalSeq2SeqTCN(nn.Module):
         )
         self.output_norm = nn.LayerNorm(self.hidden_channels)
         self.classifier = nn.Linear(self.hidden_channels, OUTPUT_CLASS_COUNT)
+        self.requires_rule_inputs = False
+        self.architecture = "causal_depthwise_tcn"
 
     @classmethod
     def from_config(
@@ -222,13 +228,15 @@ class CausalSeq2SeqTCN(nn.Module):
         combined = torch.cat((clean_raw, mask_channel, clean_delta), dim=-1)
         return combined, padding_mask
 
-    def forward(
+    def encode(
         self,
         raw: Tensor,
         raw_mask: Tensor,
         delta_steps: Tensor,
         padding_mask: Tensor | None = None,
-    ) -> Tensor:
+    ) -> Tuple[Tensor, Tensor]:
+        """Return causal temporal states and the validated real-row mask."""
+
         combined, valid_rows = self._validate_and_combine_inputs(
             raw=raw,
             raw_mask=raw_mask,
@@ -240,18 +248,208 @@ class CausalSeq2SeqTCN(nn.Module):
         for block in self.blocks:
             hidden = block(hidden, valid_rows)
         hidden = self.output_norm(hidden) * valid
+        return hidden, valid_rows
+
+    def forward(
+        self,
+        raw: Tensor,
+        raw_mask: Tensor,
+        delta_steps: Tensor,
+        padding_mask: Tensor | None = None,
+    ) -> Tensor:
+        hidden, valid_rows = self.encode(
+            raw=raw,
+            raw_mask=raw_mask,
+            delta_steps=delta_steps,
+            padding_mask=padding_mask,
+        )
+        valid = valid_rows.unsqueeze(-1).to(dtype=hidden.dtype)
         logits = self.classifier(hidden) * valid
         return logits
+
+
+class RuleGuidedResidualTCN(CausalSeq2SeqTCN):
+    """Temporal TCN with a zero-initialized bounded expert-rule correction.
+
+    The deterministic RuleModel is *not* optimized by CE.  Its continuous
+    signed margins are encoded pointwise and may only adjust the temporal
+    class-logit difference by ``[-rule_residual_scale, +rule_residual_scale]``.
+    The final residual layer starts at zero, so initialization is exactly the
+    temporal model and missing rule evidence always reduces exactly to it.
+    """
+
+    def __init__(
+        self,
+        raw_feature_count: int = RAW_FEATURE_COUNT,
+        hidden_channels: int = 48,
+        dilation_blocks: int = 10,
+        kernel_size: int = 3,
+        dropout: float = 0.1,
+        rule_hidden_channels: int = 32,
+        rule_residual_scale: float = 4.0,
+    ) -> None:
+        super().__init__(
+            raw_feature_count=raw_feature_count,
+            hidden_channels=hidden_channels,
+            dilation_blocks=dilation_blocks,
+            kernel_size=kernel_size,
+            dropout=dropout,
+        )
+        if int(rule_hidden_channels) < 4:
+            raise ValueError("rule_hidden_channels must be at least 4")
+        if float(rule_residual_scale) <= 0:
+            raise ValueError("rule_residual_scale must be positive")
+        self.rule_hidden_channels = int(rule_hidden_channels)
+        self.rule_residual_scale = float(rule_residual_scale)
+        # margin + validity per rule, followed by max margin, positive-rule
+        # fraction, and valid-rule coverage.
+        rule_input_channels = 2 * RULE_FEATURE_COUNT + 3
+        self.rule_encoder = nn.Sequential(
+            nn.Linear(rule_input_channels, self.rule_hidden_channels),
+            nn.LayerNorm(self.rule_hidden_channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        residual_hidden = max(self.hidden_channels, self.rule_hidden_channels)
+        self.residual_head = nn.Sequential(
+            nn.Linear(
+                self.hidden_channels + self.rule_hidden_channels + 2,
+                residual_hidden,
+            ),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(residual_hidden, 1),
+        )
+        nn.init.zeros_(self.residual_head[-1].weight)
+        nn.init.zeros_(self.residual_head[-1].bias)
+        self.requires_rule_inputs = True
+        self.architecture = "rule_guided_residual_tcn"
+
+    @classmethod
+    def from_config(
+        cls,
+        model_config: Any,
+        raw_feature_count: int = RAW_FEATURE_COUNT,
+    ) -> "RuleGuidedResidualTCN":
+        return cls(
+            raw_feature_count=raw_feature_count,
+            hidden_channels=int(model_config.hidden_channels),
+            dilation_blocks=int(model_config.dilation_blocks),
+            kernel_size=int(model_config.kernel_size),
+            dropout=float(model_config.dropout),
+            rule_hidden_channels=int(model_config.rule_hidden_channels),
+            rule_residual_scale=float(model_config.rule_residual_scale),
+        )
+
+    def _rule_representation(
+        self,
+        rule_margin: Tensor,
+        rule_mask: Tensor,
+        rule_hard: Tensor,
+        valid_rows: Tensor,
+        dtype: torch.dtype,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        expected = (*valid_rows.shape, RULE_FEATURE_COUNT)
+        if tuple(rule_margin.shape) != expected:
+            raise ValueError(
+                "rule_margin must have shape "
+                f"[batch, time, {RULE_FEATURE_COUNT}]"
+            )
+        if rule_mask.shape != rule_margin.shape:
+            raise ValueError("rule_mask must have the same shape as rule_margin")
+        if rule_hard.ndim == 3 and rule_hard.shape[-1] == 1:
+            rule_hard = rule_hard.squeeze(-1)
+        if rule_hard.shape != valid_rows.shape:
+            raise ValueError("rule_hard must have shape [batch, time]")
+
+        mask = rule_mask.to(device=rule_margin.device, dtype=torch.bool)
+        mask &= valid_rows.unsqueeze(-1)
+        clean_margin = torch.nan_to_num(
+            rule_margin.to(dtype=dtype), nan=0.0, posinf=10.0, neginf=-10.0
+        ).clamp(min=-10.0, max=10.0)
+        clean_margin = clean_margin * mask.to(dtype=dtype)
+        coverage = mask.to(dtype=dtype).mean(dim=-1, keepdim=True)
+        masked_for_max = torch.where(
+            mask,
+            clean_margin,
+            torch.full_like(clean_margin, -torch.inf),
+        )
+        maximum = masked_for_max.max(dim=-1, keepdim=True).values
+        maximum = torch.where(coverage > 0, maximum, torch.zeros_like(maximum))
+        positive_fraction = (
+            (mask & (clean_margin > 0)).to(dtype=dtype).sum(dim=-1, keepdim=True)
+            / float(RULE_FEATURE_COUNT)
+        )
+        encoded = self.rule_encoder(
+            torch.cat(
+                (
+                    clean_margin,
+                    mask.to(dtype=dtype),
+                    maximum,
+                    positive_fraction,
+                    coverage,
+                ),
+                dim=-1,
+            )
+        )
+        hard = (
+            rule_hard.to(device=rule_margin.device, dtype=dtype).unsqueeze(-1)
+            * valid_rows.unsqueeze(-1).to(dtype=dtype)
+        )
+        return encoded, coverage, hard
+
+    def forward(
+        self,
+        raw: Tensor,
+        raw_mask: Tensor,
+        delta_steps: Tensor,
+        padding_mask: Tensor | None = None,
+        *,
+        rule_margin: Tensor,
+        rule_mask: Tensor,
+        rule_hard: Tensor,
+    ) -> Tensor:
+        hidden, valid_rows = self.encode(
+            raw=raw,
+            raw_mask=raw_mask,
+            delta_steps=delta_steps,
+            padding_mask=padding_mask,
+        )
+        valid = valid_rows.unsqueeze(-1).to(dtype=hidden.dtype)
+        temporal_logits = self.classifier(hidden) * valid
+        rule_latent, coverage, hard = self._rule_representation(
+            rule_margin=rule_margin,
+            rule_mask=rule_mask,
+            rule_hard=rule_hard,
+            valid_rows=valid_rows,
+            dtype=hidden.dtype,
+        )
+        residual_input = torch.cat((hidden, rule_latent, coverage, hard), dim=-1)
+        delta = self.rule_residual_scale * torch.tanh(
+            self.residual_head(residual_input)
+        )
+        delta = delta * coverage * valid
+        correction = torch.cat((-0.5 * delta, 0.5 * delta), dim=-1)
+        return (temporal_logits + correction) * valid
 
 
 def build_teacher_student(
     model_config: Any,
     raw_feature_count: int = RAW_FEATURE_COUNT,
-) -> Tuple[CausalSeq2SeqTCN, CausalSeq2SeqTCN]:
+) -> Tuple[nn.Module, nn.Module]:
     """Return independently initialized student and teacher networks."""
 
-    student = CausalSeq2SeqTCN.from_config(model_config, raw_feature_count)
-    teacher = CausalSeq2SeqTCN.from_config(model_config, raw_feature_count)
+    architecture = str(
+        getattr(model_config, "architecture", "causal_depthwise_tcn")
+    )
+    if architecture == "causal_depthwise_tcn":
+        model_class = CausalSeq2SeqTCN
+    elif architecture == "rule_guided_residual_tcn":
+        model_class = RuleGuidedResidualTCN
+    else:
+        raise ValueError(f"unsupported model architecture={architecture!r}")
+    student = model_class.from_config(model_config, raw_feature_count)
+    teacher = model_class.from_config(model_config, raw_feature_count)
     return student, teacher
 
 
@@ -261,5 +459,6 @@ __all__ = [
     "DepthwiseSeparableCausalConv1d",
     "OUTPUT_CLASS_COUNT",
     "RAW_FEATURE_COUNT",
+    "RuleGuidedResidualTCN",
     "build_teacher_student",
 ]

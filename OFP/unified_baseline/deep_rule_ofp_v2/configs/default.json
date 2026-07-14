@@ -26,11 +26,13 @@
     "alignment_tolerance_seconds": 300
   },
   "model": {
-    "architecture": "causal_depthwise_tcn",
+    "architecture": "rule_guided_residual_tcn",
     "hidden_channels": 48,
     "dilation_blocks": 10,
     "kernel_size": 3,
-    "dropout": 0.1
+    "dropout": 0.1,
+    "rule_hidden_channels": 32,
+    "rule_residual_scale": 4.0
   },
   "training": {
     "teacher_epochs": 5,
@@ -55,6 +57,9 @@
     "tune_on_validation": true,
     "threshold_grid_size": 201,
     "threshold_quantile_count": 201,
-    "selection_metric": "final_score"
+    "selection_metric": "final_score",
+    "fallback_policy": "validation_safe_rule",
+    "fallback_min_gain": 0.0,
+    "fallback_tie_break": "rule_only"
   }
 }

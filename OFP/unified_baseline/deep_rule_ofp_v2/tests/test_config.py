@@ -16,6 +16,8 @@ def test_default_config_freezes_native_legacy_fgl_contract() -> None:
     assert config.protocol.name == "legacy_inclusive_v1"
     assert config.inputs.cadence_mode == "native_observed_rows"
     assert config.task.teacher_horizon_hours + config.task.future_offset_hours == 120.0
+    assert config.model.architecture == "rule_guided_residual_tcn"
+    assert config.decision.fallback_policy == "validation_safe_rule"
     assert config.receptive_field_steps >= config.student_horizon_steps
     assert len(config.fingerprint()) == 64
 

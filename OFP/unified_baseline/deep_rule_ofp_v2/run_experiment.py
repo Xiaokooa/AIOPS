@@ -36,6 +36,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment-name", type=str, default=None)
     parser.add_argument("--test-fold", type=int, choices=(1, 2, 3), default=None)
     parser.add_argument("--fgl-alpha", type=float, default=None)
+    parser.add_argument(
+        "--architecture",
+        choices=("causal_depthwise_tcn", "rule_guided_residual_tcn"),
+        default=None,
+    )
+    parser.add_argument("--rule-residual-scale", type=float, default=None)
+    parser.add_argument("--fallback-min-gain", type=float, default=None)
+    parser.add_argument("--disable-safe-rule-fallback", action="store_true")
     parser.add_argument("--future-offset-hours", type=float, default=None)
     parser.add_argument("--alignment-tolerance-seconds", type=int, default=None)
     parser.add_argument("--disable-fgl", action="store_true")
@@ -65,6 +73,18 @@ def _overrides(args: argparse.Namespace) -> dict:
         overrides.setdefault("split", {})["test_fold"] = int(args.test_fold)
     if args.fgl_alpha is not None:
         overrides.setdefault("training", {})["fgl_alpha"] = float(args.fgl_alpha)
+    if args.architecture is not None:
+        overrides.setdefault("model", {})["architecture"] = str(args.architecture)
+    if args.rule_residual_scale is not None:
+        overrides.setdefault("model", {})["rule_residual_scale"] = float(
+            args.rule_residual_scale
+        )
+    if args.fallback_min_gain is not None:
+        overrides.setdefault("decision", {})["fallback_min_gain"] = float(
+            args.fallback_min_gain
+        )
+    if args.disable_safe_rule_fallback:
+        overrides.setdefault("decision", {})["fallback_policy"] = "none"
     if args.disable_fgl:
         overrides.setdefault("training", {})["fgl_alpha"] = 1.0
     if args.no_mixed_precision:

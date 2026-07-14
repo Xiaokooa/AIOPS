@@ -26,6 +26,7 @@ from .features import (
     RAW_FEATURES,
     TEMPERATURE_OUTLIER_SENTINEL,
 )
+from .rules import RULE_FEATURE_COUNT, build_causal_rule_history
 
 
 FIXED_TEST_FOLD = 3
@@ -83,6 +84,9 @@ class ModuleRecord:
     raw_mask: np.ndarray
     anomaly: np.ndarray
     first_fault_index: int | None
+    rule_margin: np.ndarray | None = None
+    rule_valid: np.ndarray | None = None
+    rule_hard: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         self.file_name = str(self.file_name)
@@ -115,6 +119,39 @@ class ModuleRecord:
             if index != expected_first:
                 raise ValueError("first_fault_index must be the first anomaly > 0 row")
             self.first_fault_index = index
+
+        supplied_rule_fields = (
+            self.rule_margin is not None,
+            self.rule_valid is not None,
+            self.rule_hard is not None,
+        )
+        if any(supplied_rule_fields) and not all(supplied_rule_fields):
+            raise ValueError(
+                "rule_margin, rule_valid, and rule_hard must be supplied together"
+            )
+        if not any(supplied_rule_fields):
+            history = build_causal_rule_history(self.raw, self.raw_mask)
+            # Margins are clipped to [-10, 10], so float16 is a safe compact
+            # cache. Exact hard decisions are stored independently and never
+            # reconstructed from the quantized margin sign.
+            self.rule_margin = history.margin.astype(np.float16)
+            self.rule_valid = history.valid
+            self.rule_hard = history.hard_or
+        else:
+            self.rule_margin = np.asarray(self.rule_margin, dtype=np.float16)
+            self.rule_valid = np.asarray(self.rule_valid, dtype=bool)
+            self.rule_hard = np.asarray(self.rule_hard, dtype=bool)
+        expected_rule_shape = (rows, RULE_FEATURE_COUNT)
+        if self.rule_margin.shape != expected_rule_shape:
+            raise ValueError(
+                f"rule_margin must have shape [rows, {RULE_FEATURE_COUNT}]"
+            )
+        if self.rule_valid.shape != expected_rule_shape:
+            raise ValueError("rule_valid must align with rule_margin")
+        if self.rule_hard.shape != (rows,):
+            raise ValueError("rule_hard must have shape [rows]")
+        if not np.isfinite(self.rule_margin).all():
+            raise ValueError("rule_margin must contain only finite values")
 
     @property
     def first_fault_timestamp(self) -> int | None:
@@ -475,6 +512,9 @@ class NativeSequenceDataset(Dataset[dict[str, object]]):
         timestamps = record.timestamps[:length]
         raw_values = record.raw[:length]
         raw_validity = record.raw_mask[:length]
+        rule_margin = record.rule_margin[:length]
+        rule_valid = record.rule_valid[:length]
+        rule_hard = record.rule_hard[:length]
         anomaly = record.anomaly[:length]
         if self.include_supervision:
             student_targets, loss_mask = legacy_inclusive_targets(
@@ -518,6 +558,9 @@ class NativeSequenceDataset(Dataset[dict[str, object]]):
             "raw": torch.from_numpy(raw),
             "raw_mask": torch.from_numpy(raw_mask),
             "delta_steps": torch.from_numpy(delta_steps),
+            "rule_margin": torch.from_numpy(rule_margin.copy()),
+            "rule_mask": torch.from_numpy(rule_valid.copy()),
+            "rule_hard": torch.from_numpy(rule_hard.copy()),
             "targets_teacher": torch.from_numpy(teacher_targets),
             "targets_student": torch.from_numpy(student_targets),
             "loss_mask": torch.from_numpy(loss_mask),
@@ -543,9 +586,23 @@ def collate_native_sequences(batch: Sequence[Mapping[str, object]]) -> dict[str,
     batch_size = len(samples)
     max_length = int(lengths.max().item())
     feature_count = len(RAW_FEATURES)
+    rule_presence = [
+        all(name in sample for name in ("rule_margin", "rule_mask", "rule_hard"))
+        for sample in samples
+    ]
+    if any(rule_presence) and not all(rule_presence):
+        raise ValueError("rule fields must be present for every sample or none")
+    has_rule_inputs = all(rule_presence)
     raw = torch.zeros((batch_size, max_length, feature_count), dtype=torch.float32)
     raw_mask = torch.zeros((batch_size, max_length, feature_count), dtype=torch.bool)
     delta_steps = torch.zeros((batch_size, max_length, 1), dtype=torch.float32)
+    rule_margin = torch.zeros(
+        (batch_size, max_length, RULE_FEATURE_COUNT), dtype=torch.float32
+    )
+    rule_mask = torch.zeros(
+        (batch_size, max_length, RULE_FEATURE_COUNT), dtype=torch.bool
+    )
+    rule_hard = torch.zeros((batch_size, max_length), dtype=torch.bool)
     targets_teacher = torch.zeros((batch_size, max_length), dtype=torch.long)
     targets_student = torch.zeros((batch_size, max_length), dtype=torch.long)
     loss_mask = torch.zeros((batch_size, max_length), dtype=torch.bool)
@@ -562,6 +619,16 @@ def collate_native_sequences(batch: Sequence[Mapping[str, object]]) -> dict[str,
         delta_steps[batch_index, :length] = torch.as_tensor(
             sample["delta_steps"], dtype=torch.float32
         )
+        if has_rule_inputs:
+            rule_margin[batch_index, :length] = torch.as_tensor(
+                sample["rule_margin"], dtype=torch.float32
+            )
+            rule_mask[batch_index, :length] = torch.as_tensor(
+                sample["rule_mask"], dtype=torch.bool
+            )
+            rule_hard[batch_index, :length] = torch.as_tensor(
+                sample["rule_hard"], dtype=torch.bool
+            )
         targets_teacher[batch_index, :length] = torch.as_tensor(
             sample["targets_teacher"], dtype=torch.long
         )
@@ -585,7 +652,7 @@ def collate_native_sequences(batch: Sequence[Mapping[str, object]]) -> dict[str,
         )
         file_names.append(str(sample["file_name"]))
         first_fault_indices[batch_index] = int(sample["first_fault_index"])
-    return {
+    result = {
         "raw": raw,
         "raw_mask": raw_mask,
         "delta_steps": delta_steps,
@@ -600,6 +667,15 @@ def collate_native_sequences(batch: Sequence[Mapping[str, object]]) -> dict[str,
         "file_names": file_names,
         "first_fault_indices": first_fault_indices,
     }
+    if has_rule_inputs:
+        result.update(
+            {
+                "rule_margin": rule_margin,
+                "rule_mask": rule_mask,
+                "rule_hard": rule_hard,
+            }
+        )
+    return result
 
 
 @dataclass(frozen=True)

@@ -296,7 +296,7 @@ def training_coverage(dataset: Dataset) -> dict[str, int]:
 
 
 def _move_batch(batch: Mapping[str, object], device: torch.device) -> dict[str, Tensor]:
-    names = (
+    required_names = (
         "raw",
         "raw_mask",
         "delta_steps",
@@ -308,11 +308,17 @@ def _move_batch(batch: Mapping[str, object], device: torch.device) -> dict[str, 
         "lengths",
     )
     moved: dict[str, Tensor] = {}
-    for name in names:
+    for name in required_names:
         value = batch.get(name)
         if not isinstance(value, Tensor):
             raise TypeError(f"collated batch field {name!r} must be a Tensor")
         moved[name] = value.to(device=device, non_blocking=True)
+    for name in ("rule_margin", "rule_mask", "rule_hard"):
+        value = batch.get(name)
+        if value is not None:
+            if not isinstance(value, Tensor):
+                raise TypeError(f"collated batch field {name!r} must be a Tensor")
+            moved[name] = value.to(device=device, non_blocking=True)
     time = int(moved["raw"].shape[1])
     positions = torch.arange(time, device=device).unsqueeze(0)
     moved["padding_mask"] = positions < moved["lengths"].unsqueeze(1)
@@ -320,12 +326,28 @@ def _move_batch(batch: Mapping[str, object], device: torch.device) -> dict[str, 
 
 
 def _forward(model: nn.Module, batch: Mapping[str, Tensor]) -> Tensor:
-    return model(
-        raw=batch["raw"].to(dtype=torch.float32),
-        raw_mask=batch["raw_mask"].to(dtype=torch.bool),
-        delta_steps=batch["delta_steps"].to(dtype=torch.float32),
-        padding_mask=batch["padding_mask"].to(dtype=torch.bool),
-    )
+    arguments = {
+        "raw": batch["raw"].to(dtype=torch.float32),
+        "raw_mask": batch["raw_mask"].to(dtype=torch.bool),
+        "delta_steps": batch["delta_steps"].to(dtype=torch.float32),
+        "padding_mask": batch["padding_mask"].to(dtype=torch.bool),
+    }
+    if bool(getattr(model, "requires_rule_inputs", False)):
+        missing = [
+            name
+            for name in ("rule_margin", "rule_mask", "rule_hard")
+            if name not in batch
+        ]
+        if missing:
+            raise ValueError(f"rule-guided model batch missing fields: {missing}")
+        arguments.update(
+            {
+                "rule_margin": batch["rule_margin"].to(dtype=torch.float32),
+                "rule_mask": batch["rule_mask"].to(dtype=torch.bool),
+                "rule_hard": batch["rule_hard"].to(dtype=torch.bool),
+            }
+        )
+    return model(**arguments)
 
 
 def _clone_state(model: nn.Module) -> dict[str, Tensor]:

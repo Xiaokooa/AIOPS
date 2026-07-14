@@ -20,6 +20,7 @@ from fgofp.data import (
     read_module_record,
 )
 from fgofp.features import RAW_FEATURES
+from fgofp.rules import build_causal_rule_history
 
 
 def _frame(timestamps: list[float], anomaly: list[float], base: float = 1.0) -> pd.DataFrame:
@@ -69,6 +70,25 @@ def test_reader_preserves_every_native_row_and_integer_timestamps(tmp_path: Path
     assert not record.raw_mask[1, RAW_FEATURES.index("current")]
     assert not record.raw_mask[2, RAW_FEATURES.index("temperature")]
     assert native_delta_steps(record.timestamps).ravel().tolist() == [0.0, 1.0, 2.0, 0.0]
+
+
+def test_float16_rule_margin_cache_never_changes_the_hard_fallback() -> None:
+    raw = np.full((5, len(RAW_FEATURES)), 100.0, dtype=np.float32)
+    raw[:, RAW_FEATURES.index("temperature")] = 20.0
+    raw[:, RAW_FEATURES.index("current")] = [6000, 5000, 4999, 4999, 4999]
+    mask = np.ones_like(raw, dtype=bool)
+    exact = build_causal_rule_history(raw, mask)
+    record = ModuleRecord(
+        file_name="hard-parity.csv",
+        timestamps=np.arange(5, dtype=np.int64) * 300,
+        raw=raw,
+        raw_mask=mask,
+        anomaly=np.zeros(5, dtype=np.float32),
+        first_fault_index=None,
+    )
+
+    assert record.rule_margin.dtype == np.float16
+    assert np.array_equal(record.rule_hard, exact.hard_or)
 
 
 def test_reader_rejects_fractional_or_decreasing_timestamp(tmp_path: Path) -> None:
@@ -199,6 +219,9 @@ def test_native_dataset_and_collate_keep_all_rows_and_pad_only_batch() -> None:
 
     assert batch["raw"].shape == (2, 5, 12)
     assert batch["raw_mask"].dtype == torch.bool
+    assert batch["rule_margin"].shape == (2, 5, 38)
+    assert batch["rule_mask"].dtype == torch.bool
+    assert batch["rule_hard"].shape == (2, 5)
     assert batch["timestamps"].dtype == torch.int64
     assert batch["lengths"].tolist() == [3, 5]
     assert batch["file_names"] == ["short.csv", "long.csv"]
