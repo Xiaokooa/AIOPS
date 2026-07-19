@@ -1,1 +1,0 @@
-python main.py DATA.NAME Lorenz96_collective_global_factorNone SOLVER.BASE_LR 0.001 SOLVER.WEIGHT_DECAY 0.001

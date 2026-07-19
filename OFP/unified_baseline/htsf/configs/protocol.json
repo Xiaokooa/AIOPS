@@ -1,0 +1,70 @@
+{
+  "schema_version": "htsf-clean-v1",
+  "feature_schema_version": "strict-causal-v1",
+  "experiment_name": "htsf_clean_first_event_120h",
+  "seed": 42,
+  "folds": [1, 2, 3],
+  "task": {
+    "target": "first_event",
+    "horizon_hours": 120.0,
+    "exclude_at_or_after_first_fault": true
+  },
+  "window": {
+    "sequence_length": 32,
+    "patch_length": 8,
+    "patch_stride": 4,
+    "left_padding": "zero_with_mask",
+    "statistical_history": "module_prefix"
+  },
+  "sampling": {
+    "mode": "uniform_per_module",
+    "windows_per_module": 32,
+    "positive_windows_per_faulty_module": 32,
+    "negative_windows_per_faulty_module": 8,
+    "normal_windows_per_module": 8
+  },
+  "weighting": {
+    "mode": "none",
+    "temporal_positive_max_extra": 0.0,
+    "adaptive_negative_max_extra": 0.0,
+    "adaptive_warmup_epoch": 2
+  },
+  "representation": {
+    "temporal_encoder": "patchtst_style",
+    "d_model": 64,
+    "latent_dim": 128,
+    "transformer_layers": 2,
+    "attention_heads": 4,
+    "engineered_hidden": 256,
+    "dropout": 0.1
+  },
+  "training": {
+    "epochs": 5,
+    "batch_size": 192,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "device": "auto"
+  },
+  "decision": {
+    "model": "xgboost",
+    "threshold_policy": "fixed",
+    "threshold": 0.5,
+    "use_sample_weight": false,
+    "xgboost": {
+      "objective": "binary:logistic",
+      "eval_metric": "logloss",
+      "base_score": 0.5,
+      "tree_method": "hist",
+      "device": "auto",
+      "max_depth": 6,
+      "eta": 0.3,
+      "subsample": 1.0,
+      "colsample_bytree": 1.0,
+      "max_bin": 256,
+      "seed": 42,
+      "nthread": 4,
+      "num_boost_round": 100
+    }
+  }
+}

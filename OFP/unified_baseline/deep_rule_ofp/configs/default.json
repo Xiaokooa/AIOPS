@@ -1,0 +1,66 @@
+{
+  "schema_version": "drfp-ofp-v1",
+  "experiment_name": "DRFP_full",
+  "seed": 42,
+  "task": {
+    "name": "optical_module_failure_prediction",
+    "horizons_hours": [16.0, 24.0, 72.0, 120.0],
+    "primary_horizon_hours": 120.0,
+    "first_anomaly_is_failure_time": true,
+    "exclude_at_or_after_failure": true
+  },
+  "split": {
+    "test_fold": 3,
+    "validation_fraction": 0.1,
+    "seed": 42
+  },
+  "inputs": {
+    "history_hours": 168,
+    "grid_hours": 1,
+    "rule_approach_hours": 12.0,
+    "rule_persistence_hours": 6.0
+  },
+  "sampling": {
+    "mode": "uniform_per_module",
+    "endpoints_per_module": 24
+  },
+  "model": {
+    "variant": "gated_fusion",
+    "d_model": 64,
+    "latent_dim": 64,
+    "transformer_layers": 2,
+    "attention_heads": 4,
+    "patch_length": 8,
+    "patch_stride": 4,
+    "statistical_hidden": 128,
+    "rule_hidden": 128,
+    "dropout": 0.1
+  },
+  "training": {
+    "epochs": 8,
+    "batch_size": 256,
+    "inference_batch_size": 1024,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "max_positive_weight": 20.0,
+    "fused_loss_weight": 1.0,
+    "deep_auxiliary_weight": 0.3,
+    "rule_auxiliary_weight": 0.2,
+    "early_stopping_patience": 2,
+    "num_workers": 0,
+    "device": "auto"
+  },
+  "calibration": {
+    "method": "temperature",
+    "minimum_temperature": 0.05,
+    "maximum_temperature": 20.0,
+    "grid_size": 161
+  },
+  "decision": {
+    "fixed_threshold": 0.5,
+    "tune_on_validation": true,
+    "threshold_candidates": 201,
+    "selection_metric": "final_score"
+  }
+}

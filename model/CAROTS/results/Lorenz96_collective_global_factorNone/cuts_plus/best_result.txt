@@ -1,1 +1,0 @@
-Validation loss: 0.17927970100966475	Epoch: 49

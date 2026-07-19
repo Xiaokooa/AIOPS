@@ -1,0 +1,32 @@
+{
+  "suite_name": "drfp_architecture",
+  "changed_axis": "architecture",
+  "description": "One-axis architecture ablation on the fixed fold-3 OFP protocol.",
+  "experiments": [
+    {
+      "id": "D0_temporal_only",
+      "variant": "temporal_only",
+      "overrides": {"model": {"variant": "temporal_only"}}
+    },
+    {
+      "id": "D1_deep_raw_stat",
+      "variant": "deep_raw_stat",
+      "overrides": {"model": {"variant": "deep_raw_stat"}}
+    },
+    {
+      "id": "D2_rule_only",
+      "variant": "rule_only",
+      "overrides": {"model": {"variant": "rule_only"}}
+    },
+    {
+      "id": "D3_fixed_fusion",
+      "variant": "fixed_fusion",
+      "overrides": {"model": {"variant": "fixed_fusion"}}
+    },
+    {
+      "id": "D4_gated_fusion",
+      "variant": "gated_fusion",
+      "overrides": {"model": {"variant": "gated_fusion"}}
+    }
+  ]
+}

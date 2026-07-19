@@ -1,1 +1,0 @@
-python main.py DATA.NAME Lorenz96_collective_trend_factor2.0 SOLVER.BASE_LR 0.0001 SOLVER.WEIGHT_DECAY 0.001

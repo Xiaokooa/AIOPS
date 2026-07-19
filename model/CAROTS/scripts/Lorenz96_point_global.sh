@@ -1,1 +1,0 @@
-python main.py DATA.NAME Lorenz96_point_global_factor2.0 SOLVER.BASE_LR 0.0003 SOLVER.WEIGHT_DECAY 0.0001

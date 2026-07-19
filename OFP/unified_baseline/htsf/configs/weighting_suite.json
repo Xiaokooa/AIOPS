@@ -1,0 +1,39 @@
+{
+  "suite_name": "weighting",
+  "changed_axis": "weighting",
+  "description": "Full HTSF with HSS endpoints is fixed; only representation-loss weighting changes. XGBoost remains unweighted.",
+  "experiments": [
+    {
+      "id": "W0_none",
+      "variant": "htsf_fusion",
+      "overrides": {
+        "sampling": {"mode": "hss"},
+        "weighting": {"mode": "none", "temporal_positive_max_extra": 0.0, "adaptive_negative_max_extra": 0.0}
+      }
+    },
+    {
+      "id": "W1_tpw",
+      "variant": "htsf_fusion",
+      "overrides": {
+        "sampling": {"mode": "hss"},
+        "weighting": {"mode": "tpw", "temporal_positive_max_extra": 1.0, "adaptive_negative_max_extra": 0.0}
+      }
+    },
+    {
+      "id": "W2_anw",
+      "variant": "htsf_fusion",
+      "overrides": {
+        "sampling": {"mode": "hss"},
+        "weighting": {"mode": "anw", "temporal_positive_max_extra": 0.0, "adaptive_negative_max_extra": 1.0, "adaptive_warmup_epoch": 2}
+      }
+    },
+    {
+      "id": "W3_tpw_anw",
+      "variant": "htsf_fusion",
+      "overrides": {
+        "sampling": {"mode": "hss"},
+        "weighting": {"mode": "tpw_anw", "temporal_positive_max_extra": 1.0, "adaptive_negative_max_extra": 1.0, "adaptive_warmup_epoch": 2}
+      }
+    }
+  ]
+}

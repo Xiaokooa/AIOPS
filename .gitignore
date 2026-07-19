@@ -1,7 +1,10 @@
 dataset/
 Files/
 analysis_outputs/
+analysis_artifacts/
 OFP_DL_model2_compat_results/
+OFP_DL_official_results/
+OFP_DL_official_dev_results/
 OFP_asp_dac_6pages_1pagereference_/
 output/
 reports/
@@ -10,6 +13,12 @@ visualization/
 output_test/
 _smoke_input/
 catboost_info/
+
+# Repository-local scratch and generated review output
+/.codex_tmp/
+/.review_render/
+/.tmp_su_pdf/
+/tmp/
 
 __pycache__/
 *.py[cod]
