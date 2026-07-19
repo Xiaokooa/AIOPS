@@ -1,1 +1,0 @@
-"""Official FTEformer OFP model."""
