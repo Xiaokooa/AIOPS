@@ -25,7 +25,7 @@ def generate_data(root):
             frame.loc[47, 'anomaly'] = 1
         name = f'synthetic_{i:03d}.csv'
         frame.to_csv(data_dir/name, index=False)
-        rows.append(dict(file_name=name, Label=faulty, folder_index=(i//2)%3+1))
+        rows.append(dict(file_name=name, Label=faulty))
     index_path = root/'index.csv'
     pd.DataFrame(rows).to_csv(index_path, index=False)
     return data_dir, index_path
@@ -38,8 +38,5 @@ def run_smoke(output, device='cpu'):
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(output)
     data_dir, index_path = generate_data(output)
-    run_experiment(data_dir, index_path, output/'legacy_cv', 'legacy_cv', VARIANTS,
-                   device=device, folds=(1,), smoke=True)
-    run_experiment(data_dir, index_path, output/'fixed_holdout', 'fixed_holdout',
-                   device=device, smoke=True)
-    print('PASS: synthetic training, five variants, validation selection, fixed-test inference and seven metrics.')
+    run_experiment(data_dir,index_path,output/'experiments',VARIANTS,device=device,smoke=True)
+    print('PASS: synthetic training, five component variants, validation selection, test inference and seven metrics.')

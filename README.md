@@ -1,165 +1,123 @@
 # SSFFN: Sensor and Statistical Feature Fusion Network
 
-Code for optical-transceiver failure prediction from Digital Diagnostic
-Monitoring (DDM) measurements. The current paper model is **SSFFN (split3)**.
-Its implementation and reproduction entry point are in [`OFP/ssffn`](OFP/ssffn).
+Implementation of **SSFFN** for optical-transceiver failure prediction using
+Digital Diagnostic Monitoring (DDM) data.
 
-## Model
+## Framework
 
-SSFFN processes two complementary inputs with the **Sensor Measurement Branch
-(SMB)** and **Statistical Feature Branch (SFB)**. Both are input embeddings; the
-model has one **Sensor Interaction Transformer (SIT)** and one prediction head.
+[![SSFFN architecture](assets/ssffn-framework.png)](assets/ssffn-framework.pdf)
 
-```mermaid
-flowchart LR
-    A[DDM observations] --> B[Causal preprocessing]
-    B --> C[SMB: current sensor measurements]
-    B --> D[SFB: statistics and channel relations]
-    C --> E[12 sensor tokens]
-    D --> F[3 statistical tokens]
-    E --> G[Sensor Interaction Transformer]
-    F --> G
-    M[Learnable module token] --> G
-    G --> H[Module token readout]
-    H --> I[Failure probability]
-    J[Hierarchical Sample Selection] -. training windows .-> B
-```
+The figure is the framework diagram used in the paper. Click it for the PDF.
 
-- **SMB:** 12 measurements, training-fitted distribution encoding and linear
-  token projection. There is no separate temporal encoder or history residual.
-- **SFB:** 80 continuous features grouped into three tokens: level/range (36),
-  variability/shape (36), and channel relations (8). Threshold-derived features
-  are excluded from the model.
-- **SIT:** 16 tokens, width 64, three layers, four attention heads, feed-forward
-  width 192, and a learnable module token for prediction.
-- **Hierarchical Sample Selection (HSS):** per-module quotas and rule-free
-  distribution/risk/coverage sampling. Training uses ordinary module-averaged BCE.
+SSFFN combines a **Sensor Measurement Branch (SMB)** and a **Statistical Feature
+Branch (SFB)** through a **Sensor Interaction Transformer (SIT)**. SMB embeds the
+12 current sensor measurements. SFB organizes 80 statistical and channel-relation
+features into three groups: signal levels, variability, and channel relations.
+The learnable module token provides the representation for failure prediction.
+**Hierarchical Sample Selection (HSS)** selects informative training windows
+under per-transceiver quotas.
 
-## Install and check
+## Installation
 
-Use Python 3.11 or later and a working PyTorch installation. Install the
-appropriate PyTorch build for your CPU/CUDA environment, then the small set of
-remaining dependencies:
+Use Python 3.11 or later with a suitable CPU or CUDA installation of PyTorch.
+Run the following commands from the repository root:
 
 ```bash
 pip install -r OFP/ssffn/requirements.txt
 python -m unittest OFP.ssffn.tests.test_contract -v
+```
+
+To check training and inference with synthetic data:
+
+```bash
 python -m OFP.ssffn smoke --output output/ssffn_smoke --device cpu
 ```
 
-The smoke check creates synthetic data and exercises training, all four module
-ablations, HSS refresh, checkpoint loading, and evaluation. Its short runs are
-**installation checks, not paper results**. `train` always uses 16 epochs per fold.
+This short installation check does not produce paper experiment results.
 
 ## Data
 
-Place one CSV per transceiver under a local directory, for example
-`dataset/training`. Each CSV contains `timestamp`, `anomaly` and the 12 DDM sensor
-columns listed in the [data specification](OFP/ssffn/docs/DATA.md). `anomaly` is a
-target/reference field and is never a model input. An index CSV specifies
-`file_name,folder_index,Label`, one row per transceiver.
+Store one CSV per transceiver. Each CSV contains:
 
-The release adds no production data, per-module predictions, or trained weights.
-Obtain the data through its authorized source. Run commands from the repository
-root. A GPU is recommended for full experiments.
+- `timestamp`: observation time in Unix seconds.
+- `temperature`, `current`, `currentTXPower`, `currentRXPower`.
+- `currentMultiRXPower1` through `currentMultiRXPower4`.
+- `currentMultiTXPower1` through `currentMultiTXPower4`.
+- `anomaly`: the event label, excluded from model inputs; optional for inference.
 
-## Reproduce the archived paper results
+Keep observations in timestamp order and measurements in the dataset's original
+units. Invalid readings are causally forward-filled, with zero used when no
+valid observation is available. Raw production data are not included.
 
-The archived numbers below were produced with **three rotating outer test folds**,
-with an 80:20 training/validation split inside each outer training partition.
-They are not results on the subsequently defined fixed 20% test set.
+Create an index with one row per transceiver. `Label` is its binary failure label:
+
+```csv
+file_name,Label
+module_001.csv,0
+module_002.csv,1
+```
+
+We partition transceivers into fixed training and test subsets at an 80:20 ratio,
+stratified by failure label, using seed 42. All observations of a transceiver
+remain in the same subset. We then perform three-fold cross-validation within
+the training subset for model selection and evaluate the selected model on the
+fixed test subset. Normalization and quantile encodings use training data only;
+alarm thresholds and the fold model are selected by validation F1.
+
+## Training
 
 ```bash
 python -m OFP.ssffn train \
-  --protocol legacy_cv \
   --data-dir dataset/training \
-  --index 'dataset/train_test_set_index(in).csv' \
-  --output output/ssffn_legacy_s42 \
-  --all-ablations --training-seed 42 --device cuda
+  --index dataset/index.csv \
+  --output output/ssffn \
+  --device cuda
 ```
 
-All three folds are run by default. To run only the main model, omit
-`--all-ablations`. Use `--variant no_sensor`, `no_statistics`, `no_sit`, or
-`no_hss` for an individual ablation. Use a new output directory for each run.
+The model trains for 16 epochs per fold with batches of 32 modules and ordinary
+BCE. SIT uses three layers, hidden dimension 64, four heads, feed-forward
+dimension 192, and dropout 0.15. AdamW uses learning rate 0.0003 and weight decay
+0.01. HSS retains eight normal windows from at most 64 candidates and refreshes
+selection every two epochs. Settings are in
+[`configs/ssffn.json`](OFP/ssffn/configs/ssffn.json).
 
-| Model | Precision | Recall | F1 | Accuracy | AvgLead (h) | AFWS | FP ↓ |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| SSFFN | **0.928** | **0.558** | **0.697** | **0.851** | 20.671 | **2.548** | **178** |
-| w/o SMB | 0.669 | 0.517 | 0.583 | 0.773 | **25.947** | 2.357 | 1050 |
-| w/o SFB | 0.921 | 0.557 | 0.695 | 0.850 | 15.273 | 2.544 | 195 |
-| w/o SIT | 0.831 | 0.508 | 0.631 | 0.817 | 24.019 | 2.448 | 423 |
-| w/o HSS | 0.904 | 0.548 | 0.682 | 0.843 | 21.216 | 2.526 | 239 |
+## Component ablations
 
-These are pooled module-level results at training seed 42, with 16 epochs for
-each of the 15 model/fold combinations. Best values are bold. AvgLead is
-conditional on successful detections and should be read alongside Recall.
-Exact aggregate and per-fold values are in [`results`](OFP/ssffn/results).
-This release has been checked for implementation parity; full production
-experiments were not rerun as part of packaging it.
+Add `--all-ablations` to the training command to run SSFFN and all four ablations,
+or use `--variant` to run one:
 
-## Fixed 80:20 holdout protocol
+| Argument | Ablation |
+|---|---|
+| `full` | SSFFN |
+| `no_sensor` | Remove SMB tokens |
+| `no_statistics` | Remove SFB tokens |
+| `no_sit` | Replace SIT with branch-wise mean pooling and equally weighted fusion |
+| `no_hss` | Replace HSS with uniform sampling under the same window budget |
 
-For new experiments under the revised split, use:
+Every component variant uses the same data partitions and training budget.
 
-```bash
-python -m OFP.ssffn train \
-  --protocol fixed_holdout \
-  --data-dir dataset/training \
-  --index 'dataset/train_test_set_index(in).csv' \
-  --output output/ssffn_fixed_s42 \
-  --all-ablations --training-seed 42 --device cuda
-```
+## Prediction and evaluation
 
-Transceivers are split 80:20, stratified by failure label, with seed 42. The
-training partition has three inner folds. Each fold model trains for 16 epochs;
-its alarm threshold is chosen on its validation fold. The fold model with the
-highest validation F1 is selected, then evaluated once on the fixed test set.
-It is not refitted on all 80% of the data and no test-set ensemble is constructed.
-The test partition is excluded from feature normalization and HSS.
-**Production results for this new protocol are not included.**
-
-See [PROTOCOL.md](OFP/ssffn/docs/PROTOCOL.md) for split/selection details, the
-unchanged float32 timestamp convention, AFWS, and reproduction boundaries.
-
-## Inference and evaluation
-
-Each run writes a self-contained `aligned_encoder.pt`, normalization, split
-manifest, validation-selected threshold, training history and seven-metric
-reports. Use the chosen threshold from `completed.json` (legacy) or
-`selection.json` (fixed holdout):
+The output directory contains `selection.json` for the selected checkpoint and
+validation threshold. Use those values when running prediction:
 
 ```bash
 python -m OFP.ssffn predict \
-  --checkpoint output/ssffn_legacy_s42/full/ssffn/fold_1/aligned_encoder.pt \
-  --data-dir path/to/module_csvs --output output/predictions \
+  --checkpoint path/to/aligned_encoder.pt \
+  --data-dir path/to/module_csvs \
+  --output output/predictions \
   --threshold 0.5 --device cuda
 
 python -m OFP.ssffn evaluate \
-  --predictions output/predictions --labels path/to/labeled_module_csvs \
+  --predictions output/predictions \
+  --labels path/to/labeled_module_csvs \
   --output output/evaluation
 ```
 
-The `0.5` threshold above is an example; use the value selected by your run.
-Evaluation reports Precision, Recall, F1, Accuracy, AvgLead in hours, AFWS and FP.
-AFWS is `F1 + Accuracy + tanh(AvgLead_hours)` and contains no MinLead term.
+The threshold `0.5` is an example; use the value in your run's `selection.json`.
+Reports contain Precision, Recall, F1, Accuracy, AvgLead in hours, AFWS, and FP.
+AFWS is `F1 + Accuracy + tanh(AvgLead_hours)`.
 
-## Repository layout
-
-```text
-OFP/ssffn/
-  model.py              Public model and active-feature interface
-  experiment.py         Training, module ablations and protocol orchestration
-  inference.py          Self-contained checkpoint loading and CSV prediction
-  splits.py             Module-level fixed split and inner folds
-  report.py             All seven paper metrics
-  configs/split3.json    Full-budget reproduction configuration
-  _engine/              Versioned numerical core and compatibility initialization
-  docs/                 Data, protocol and release validation notes
-  results/              Archived aggregate results, explicitly labeled legacy CV
-  tests/                Model, feature, split and metric checks
-```
-
-Earlier HTSF, rule/tree baselines and temporal-model benchmarks remain under
-`OFP/unified_baseline`, `OFP/model1`, `OFP/model2`, and `OFP/deep_learning`.
-They are historical implementations, not the current SSFFN entry point.
-The old paper-assets directory also describes an earlier model version.
+The implementation is in [`OFP/ssffn`](OFP/ssffn): `model.py` defines the model,
+`experiment.py` handles training and selection, `inference.py` loads checkpoints,
+and `report.py` produces the evaluation tables.

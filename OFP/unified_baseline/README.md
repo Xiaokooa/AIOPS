@@ -146,12 +146,3 @@ training provenance.
 The supplied data also imposes an observable-recall ceiling: among 4,102
 faulty modules, only 936 have any pre-fault observation, so unconditional
 Recall cannot exceed `936 / 4102 = 22.818%` under the official module metric.
-
-## Clean HTSF extension
-
-The protocol-locked hybrid model now lives in [`htsf/`](htsf/README.md).  It
-reuses this directory's first-event labels, Raw/Statistical/Expert registry and
-official evaluator, while keeping architecture, endpoint sampling, loss
-weighting and threshold policy in separate audited suites.  It also provides a
-same-endpoint B2 control so a representation gain is not confused with the
-change from all-row XGBoost training to sampled temporal windows.

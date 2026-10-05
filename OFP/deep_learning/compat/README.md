@@ -16,9 +16,7 @@ compat/
 └── scripts/
 ```
 
-Paper-suite orchestration, result-only utilities, and dedicated ablation/sweep
-launchers were removed during repository cleanup. Use
-`OFP/unified_baseline/htsf` for the maintained HTSF experiment framework.
+The paper model and its component ablations are implemented in `OFP/ssffn`.
 
 Run entry points from the repository root, for example:
 

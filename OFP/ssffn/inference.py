@@ -13,7 +13,7 @@ from .model import build_model
 def load_checkpoint(path, device='cpu'):
     # Release checkpoints contain tensors and primitive containers only.
     artifact = torch.load(path, map_location='cpu', weights_only=True)
-    if artifact.get('release_model') != 'SSFFN-split3':
+    if artifact.get('release_model') != 'SSFFN':
         raise ValueError('Use a checkpoint exported by the SSFFN release trainer')
     cfg = CompatCfg(**artifact['cfg'])
     cfg.device = engine.resolve_runtime_device(device)

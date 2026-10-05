@@ -10,7 +10,6 @@ def main():
     parser = argparse.ArgumentParser(description='SSFFN paper model, module ablations and first-warning evaluation')
     commands = parser.add_subparsers(dest='command', required=True)
     train = commands.add_parser('train', help='16 epochs per fold; validation-only threshold selection')
-    train.add_argument('--protocol', choices=('legacy_cv', 'fixed_holdout'), required=True)
     train.add_argument('--data-dir', type=Path, required=True)
     train.add_argument('--index', type=Path, required=True)
     train.add_argument('--output', type=Path, required=True)
@@ -18,7 +17,6 @@ def main():
     train.add_argument('--all-ablations', action='store_true')
     train.add_argument('--training-seed', type=int, default=42)
     train.add_argument('--device', default='cuda')
-    train.add_argument('--folds', nargs='+', type=int, default=[1,2,3])
     split = commands.add_parser('split', help='Generate the fixed 80:20 stratified split, seed 42')
     split.add_argument('--index', type=Path, required=True)
     split.add_argument('--output', type=Path, required=True)
@@ -38,9 +36,9 @@ def main():
     args = parser.parse_args()
     if args.command == 'train':
         from .experiment import run_experiment
-        run_experiment(args.data_dir, args.index, args.output, args.protocol,
+        run_experiment(args.data_dir, args.index, args.output,
                        VARIANTS if args.all_ablations else (args.variant,),
-                       args.training_seed, args.device, tuple(args.folds))
+                       args.training_seed, args.device)
     elif args.command == 'split':
         from .splits import fixed_manifest
         import pandas as pd

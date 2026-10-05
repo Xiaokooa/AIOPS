@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Precompute shared OFP expert-statistical feature arrays.")
     parser.add_argument("--data_dir", type=Path, default=Path("dataset/training"))
     parser.add_argument("--index_path", type=Path, default=Path("dataset/train_test_set_index(in).csv"))
-    parser.add_argument("--cache_dir", type=Path, default=Path("OFP_DL_model2_compat_results/htsf_feature_cache"))
+    parser.add_argument("--cache_dir", type=Path, default=Path("OFP_DL_model2_compat_results/feature_cache"))
     parser.add_argument("--feature_mode", choices=["ofp", "ofp_plus"], default="ofp")
     parser.add_argument("--target_mode", choices=["ahead120", "anomaly", "module_fault"], default="ahead120")
     parser.add_argument("--rule_mode", choices=["none", "ofp_rules", "model2_simple"], default="none")

@@ -1,0 +1,18 @@
+{
+  "batch_size": 192,
+  "normal_windows_per_module": 8,
+  "threshold_grid": "0.001,0.003,0.005,0.01,0.02,0.03,0.05,0.07,0.10,0.15,0.20,0.25,0.30,0.40,0.50,0.60,0.70,0.80,0.90,0.95,0.99",
+  "num_workers": 0,
+  "epochs": 16,
+  "negative_windows_per_faulty_module": 8,
+  "log_batches": 1000,
+  "no_tf32": false,
+  "seed": 42,
+  "grad_clip": 1.0,
+  "amp": true,
+  "weight_decay": 0.01,
+  "lr": 0.0003,
+  "max_cached_files": 20000,
+  "positive_windows_per_module": 32,
+  "seq_len": 32
+}

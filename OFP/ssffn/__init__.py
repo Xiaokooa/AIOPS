@@ -1,2 +1,1 @@
-"""SSFFN paper implementation."""
-__version__ = "1.0.0"
+"""Sensor and Statistical Feature Fusion Network."""
