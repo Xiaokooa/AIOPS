@@ -1,0 +1,152 @@
+{
+  "model": "SSFFN split3",
+  "sources": [
+    {
+      "module": "training",
+      "source": "research/ssf_module_suite/runner.py",
+      "source_sha256": "bb5539341bb6240ed6236374255d8743e9faa50cc6fb59e7eaaacabdc27dbc73",
+      "release_sha256": "819ceb014c32e7128a354abb72ce488de309e51f0e9e3d269710ff9074e1ce4b",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "token_groups",
+      "source": "research/sfb_token_study/components.py",
+      "source_sha256": "7bf056903d0aace0742c062073d6c68da0122f73f7083dd1fe3eb7bab37bd0d3",
+      "release_sha256": "91bd6c93025ee6df77d614993a87d6b568d39366169604e467b40539e2ab472f",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "modules",
+      "source": "research/ssf_module_suite/components.py",
+      "source_sha256": "deb553946610ea5c084dd103bbf602fc6f08bbe82d2db272b3613f1588af9bc0",
+      "release_sha256": "4130c311fe28845b46fd98133a9aacfb3b931bde5c15b0e6d31f56fe4b700aa7",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "statistical_input",
+      "source": "research/htsf_statistical_ablation/components.py",
+      "source_sha256": "58bdf6005b926c9019096d8d80fab79ba5731e8d48dac956d6929209cb3e3776",
+      "release_sha256": "1a0825dd88cf0e07507ff7300826ecb2da6e002c2fdb171633b080f9d8e6612f",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "initialization",
+      "source": "research/htsf_expert_followup/components.py",
+      "source_sha256": "606fd816de15ccd9050c055d381bfd75b8ce4afb6907e45f21036291e7290d46",
+      "release_sha256": "2dc9f22e2f2d9fae394af523269f625b41be449ae991b25317d146a392780a31",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "input_ablation",
+      "source": "research/htsf_shared_ablation/components.py",
+      "source_sha256": "017c353ebd098b71927739433ea6f7f43be9c0bcff6050ca5b1402db067bdfad",
+      "release_sha256": "ed2635487a7ea2db7810803c47f5f865ca63e9b6676424e106a2eb1d749fb206",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "backbone",
+      "source": "research/htsf_shared_sit/shared_network.py",
+      "source_sha256": "23b786370be4f51f16bfeece8a05c7d35677d32ba348ab61d22b3a26e329389c",
+      "release_sha256": "6befd95fabe72c5b6bde5808a66b2f11b912d717e34556cbc00f5f089d788c2a",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "distribution",
+      "source": "research/htsf_dasa_transfer/components.py",
+      "source_sha256": "07bfce136395e1f40628760dd8169febf894190200a459b968e869aa27dd05be",
+      "release_sha256": "310b3134f90b3d39813ebb38e5bf2b50e9410b04ef8574dc174318f8fb292398",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "module_batches",
+      "source": "research/htsf_dasa_transfer/module_groups.py",
+      "source_sha256": "5fe3db23c2926390b2a32ef4eb8824eacfa96ba20a530c8cd11eb9c52364d1af",
+      "release_sha256": "5e80a7a2f8bd105ea58bf21d86a9d547cd271559d3d93073e748185d949b4dac",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "timestamp_policy",
+      "source": "research/htsf_dasa_transfer/prepare.py",
+      "source_sha256": "396b50609d9839d78596c65ca7f1760b361a310e40f9c28b49673790c1958512",
+      "release_sha256": "ad34cd0edcbebfab894c7d7a5be1633166a1b1f6643d1d26d578b6b9fa7db24b",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "loss_helpers",
+      "source": "research/htsf_dual_optimization/components.py",
+      "source_sha256": "efbff6f6f4ae486a490bab979cb4dfdd60ff82a57d7deab72ed09110b561cfab",
+      "release_sha256": "751db64474439b9ee1dfa7b5c22d9b8bb17e528315283d595a1fff1a120ff5c4",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "data",
+      "source": "OFP_DL_model2_compat/run_model2_compat_deep.py",
+      "source_sha256": "0392d147b7633729663d0d40f2ccc25c0fc68520f45880fe1510f361a94a8d5b",
+      "release_sha256": "cfd5ea07f27e8caf20880a64f925702452933958000990e17a20370fd284b63f",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "evaluation",
+      "source": "OFP_DL_model2_compat/run_model2_compat_tabular_fusion.py",
+      "source_sha256": "9e8e18e83217a15781f3a6768c64e57e6393da2d3566be179b24b2ca8fbeb5a8",
+      "release_sha256": "58f6d6fdc52212b9d0c514caebf2fdb9749226f9134ad0c23d769f4dccd382c8",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "leadtime",
+      "source": "OFP_DL_model2_compat/lead_time_sweep.py",
+      "source_sha256": "dee8fff59b772801a97c275c2b2e3203af36bbd1a36e2f79ad4133baa09b7f9f",
+      "release_sha256": "d44631691556787ed097c4dee13bafdbc126fabb470a6eee9faf7f9bb449f34c",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "index",
+      "source": "OFP_DL_official/common/index_split.py",
+      "source_sha256": "99f08d65fcf5a8b5ceed085651a64aa9e9f9e361bd392f4ef31b2517975caa23",
+      "release_sha256": "a5df8ae9a7569d1e060b3855e2871e3625d226243b077855cccb1d36ea6464cf",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "runtime",
+      "source": "OFP_DL_official/common/trainer.py",
+      "source_sha256": "d5eeee37601fe15b07d892118aa04c1d8ace33770618a70041399d668b30d828",
+      "release_sha256": "26a5b4c37fba9ec0c088f943ba9a683849f782efa8e4ed1cda67583ba5b07a3f",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "allocation",
+      "source": "OFP_DL_official/common/formal_data.py",
+      "source_sha256": "dbad6273283baf82aa1e627fe7f18ebd72b074617687372454c8298a86637e6a",
+      "release_sha256": "1b031e98acf96a15bf98bdd20d5cdc66c401efd1258c640884f8c2285bf06eef",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "losses",
+      "source": "OFP_DL_official/common/losses.py",
+      "source_sha256": "a660f4c0a04d88dc011a77692ab1552cabd6ac32f6b800f6c3e8dbed7c87620a",
+      "release_sha256": "771144ac95624307b716bfbb3bf7b413b10b854c640413f9e4d910ed9459aaac",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "metrics",
+      "source": "OFP_DL_official/ofp_protocol/evaluator.py",
+      "source_sha256": "b4b8a081747634a3f434b293b16f8f5f68858233e843fe149f766be08f7796a7",
+      "release_sha256": "6764c0f190fd61a369a6d972d4f2e454feb3ab7ae3a6877efd4ca1b0941625bb",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "feature_base",
+      "source": "OFP_DL_official/ofp_protocol/run_ofp_baselines.py",
+      "source_sha256": "ce7fc596d75bee0a5510a071f3fd0ba88776a5ef1bb93393548b256da8720b28",
+      "release_sha256": "443557901cc3b531a769ff38c30600007b3cd838e9800e97fdbed9f151bd5212",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    },
+    {
+      "module": "feature_schema",
+      "source": "OFP/model2/ExperimentFeatureSchema.py",
+      "source_sha256": "186d0aab3e07701959f3f04785ea032b5017ea7e28174abc7bf891acd4923dbd",
+      "release_sha256": "38b47d208f14d46ec03f95b582745c95896efb7d0851cadefd787c62274e9241",
+      "changes": "Package-local imports; unused temporal-model imports removed; helper-only extraction where applicable."
+    }
+  ]
+}
