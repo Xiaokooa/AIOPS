@@ -62,7 +62,8 @@ stratified by failure label, using seed 42. All observations of a transceiver
 remain in the same subset. We then perform three-fold cross-validation within
 the training subset for model selection and evaluate the selected model on the
 fixed test subset. Normalization and quantile encodings use training data only;
-alarm thresholds and the fold model are selected by validation F1.
+alarm thresholds and the fold model are selected by validation F1. Threshold
+ties are resolved by AFWS, Precision, Accuracy, Recall, then the larger threshold.
 
 ## Training
 
@@ -121,3 +122,30 @@ AFWS is `F1 + Accuracy + tanh(AvgLead_hours)`.
 The implementation is in [`OFP/ssffn`](OFP/ssffn): `model.py` defines the model,
 `experiment.py` handles training and selection, `inference.py` loads checkpoints,
 and `report.py` produces the evaluation tables.
+
+
+## Baseline models
+
+`OFP/baselines` contains the Rule Model, tree-classifier constructors, and binary
+classification adapters for iTransformer, PatchTST, FITS, and ModernTCN.
+The adapters accept sensor windows and observation masks with shape `[B,L,12]`.
+FITS also returns sensor and frequency attribution tensors after its logits.
+Set their configuration explicitly for a comparison experiment. The SSFFN
+training command above runs SSFFN and its component ablations.
+
+```python
+from OFP.baselines.patchtst import PatchTSTCfg, PatchTSTClassifier
+from OFP.baselines.trees import build_tree
+
+model = PatchTSTClassifier(PatchTSTCfg(seq_len=288, n_sensors=12))
+forest = build_tree("random_forest", n_estimators=100, random_state=2024)
+```
+
+Optional tree dependencies: `pip install -r OFP/baselines/requirements.txt`.
+Only required upstream layers are included under `third_party`; their sources
+and licenses are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## License
+
+Project code is distributed under the [MIT License](LICENSE). Third-party
+components retain their original copyright notices and licenses.

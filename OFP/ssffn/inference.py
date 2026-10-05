@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from ._engine import training as engine
-from ._engine.data import CompatCfg, FeatureNormStats, Model2FeatureCache
+from ._engine.data import TrainingConfig, FeatureNormStats, FeatureCache
 from .model import build_model
 
 
@@ -15,12 +15,14 @@ def load_checkpoint(path, device='cpu'):
     artifact = torch.load(path, map_location='cpu', weights_only=True)
     if artifact.get('release_model') != 'SSFFN':
         raise ValueError('Use a checkpoint exported by the SSFFN release trainer')
-    cfg = CompatCfg(**artifact['cfg'])
+    cfg = TrainingConfig(**artifact['cfg'])
     cfg.device = engine.resolve_runtime_device(device)
     cfg.module_cache_dir = ''  # Never reuse a training-data cache for incoming CSVs.
     cfg.max_cached_files = 32
     stats = FeatureNormStats(**artifact['normalization'])
-    names = engine.compat_feature_names(cfg)
+    names = engine.get_feature_names(cfg)
+    if stats.feature_names != names:
+        raise ValueError('Checkpoint feature schema does not match the 80-feature SSFFN release')
     raw = [names.index(n) for n in artifact['raw_features']]
     stat = [names.index(n) for n in artifact['base_stat_features']]
     mean, std = stats.arrays()
@@ -44,7 +46,7 @@ def predict(checkpoint, data_dir, file_names, output_dir, threshold, device='cpu
         raise FileExistsError(f'Prediction output must be empty: {output_dir}')
     model, cfg, stats, raw, stat, indices = load_checkpoint(checkpoint, device)
     mean, std = stats.arrays()
-    cache = Model2FeatureCache(Path(data_dir), mean, std, cfg, {})
+    cache = FeatureCache(Path(data_dir), mean, std, cfg, {})
     estimator = engine.frozen_encoder_head(model)
     # Scoring uses every row. Target labels and validity-for-training do not
     # select inference positions and are never passed as neural inputs.

@@ -1,0 +1,4 @@
+-r ../ssffn/requirements.txt
+xgboost>=2
+lightgbm>=4
+catboost>=1.2

@@ -89,26 +89,16 @@ def select_threshold_for_scores(score_frames: dict[str, pd.DataFrame], label_dir
     constraint_tolerance = max(0.0, float(getattr(args, 'threshold_constraint_tolerance', 0.0)))
     rule_metrics: dict[str, float] = {}
     rule_detail: pd.DataFrame | None = None
-    if constraint == 'rule_nondegrade':
-        rule_frames = {name: apply_threshold(frame, 1.000001, confirm_k=confirm_k, confirm_m=confirm_m) for name, frame in score_frames.items()}
-        rule_summary, rule_detail = evaluate_prediction_frames(rule_frames, label_dir, min_hit_lead_hours=0.0, truth_by_name=truth_by_name)
-        rule_metrics = {str(row['Item']): float(row['Value']) for _, row in rule_summary.iterrows()}
-        best_threshold = 1.000001
-        best_metrics = dict(rule_metrics)
-        best_detail = rule_detail
-        best_key = (float(rule_metrics.get(metric_key, rule_metrics.get('f1_score', 0.0))), float(rule_metrics.get('final_score', 0.0)), float(rule_metrics.get('precision', 0.0)), float(rule_metrics.get('accuracy', 0.0)), float(rule_metrics.get('recall', 0.0)), best_threshold)
     for threshold in candidates:
         pred_frames = {name: apply_threshold(frame, float(threshold), confirm_k=confirm_k, confirm_m=confirm_m) for name, frame in score_frames.items()}
         summary_df, detail_df = evaluate_prediction_frames(pred_frames, label_dir, min_hit_lead_hours=0.0, truth_by_name=truth_by_name)
         metrics = {str(row['Item']): float(row['Value']) for _, row in summary_df.iterrows()}
         value = float(metrics.get(metric_key, metrics.get('f1_score', 0.0)))
         feasible = True
-        if constraint == 'rule_nondegrade':
-            feasible = float(metrics.get('f1_score', 0.0)) + constraint_tolerance >= float(rule_metrics.get('f1_score', 0.0)) and float(metrics.get('recall', 0.0)) + constraint_tolerance >= float(rule_metrics.get('recall', 0.0))
         row = {'threshold': float(threshold), 'confirm_k': float(confirm_k), 'confirm_m': float(confirm_m), 'constraint_feasible': float(feasible)}
         row.update(metrics)
         search_rows.append(row)
-        key = (value, float(metrics.get('final_score', 0.0)), float(metrics.get('precision', 0.0)), float(metrics.get('accuracy', 0.0)), float(metrics.get('recall', 0.0)), float(threshold))
+        key = (value, float(metrics.get('afws', 0.0)), float(metrics.get('precision', 0.0)), float(metrics.get('accuracy', 0.0)), float(metrics.get('recall', 0.0)), float(threshold))
         if feasible and (best_key is None or key > best_key):
             best_key = key
             best_threshold = float(threshold)
@@ -117,10 +107,6 @@ def select_threshold_for_scores(score_frames: dict[str, pd.DataFrame], label_dir
     val_dir = Path(run_dir) / 'validation' / tag
     val_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(search_rows).to_csv(val_dir / 'threshold_search.csv', index=False)
-    if rule_metrics:
-        pd.DataFrame({'Item': list(rule_metrics.keys()), 'Value': list(rule_metrics.values())}).to_csv(val_dir / 'rule_only_evaluate_result.csv', index=False)
-        if rule_detail is not None:
-            rule_detail.to_csv(val_dir / 'rule_only_module_decisions.csv', index=False)
     pd.DataFrame({'Item': list(best_metrics.keys()), 'Value': list(best_metrics.values())}).to_csv(val_dir / 'best_evaluate_result.csv', index=False)
     if best_detail is not None:
         best_detail.to_csv(val_dir / 'best_module_decisions.csv', index=False)

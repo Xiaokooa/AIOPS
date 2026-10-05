@@ -1,1 +1,0 @@
-"""ModernTCN OFP official adapter."""

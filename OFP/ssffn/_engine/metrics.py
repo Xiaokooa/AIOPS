@@ -77,11 +77,9 @@ def evaluate_prediction_folder(prediction_dir: Path, label_dir: Path, predict_co
     accuracy = (tp + tn) / len(detail_df) if len(detail_df) else 0.0
     lead_hours = detail_df.loc[detail_df['hit'] > 0, 'lead_hour'].dropna().astype(float)
     avg_lead_hour = float(lead_hours.mean()) if not lead_hours.empty else 0.0
-    min_lead_hour = float(lead_hours.min()) if not lead_hours.empty else 0.0
     avg_lead_score = math.tanh(avg_lead_hour)
-    min_lead_score = math.tanh(min_lead_hour)
-    final_score = f1 + avg_lead_score + min_lead_score + accuracy
-    summary_df = pd.DataFrame({'Item': ['final_score', 'f1_score', 'precision', 'recall', 'all_hit_cnt', 'all_predict_pos_cnt', 'all_true_pos_cnt', 'avg_lead_score', 'avg_lead_hour', 'min_lead_score', 'min_lead_hour', 'lead_pread_cnt', 'accuracy', 'tp', 'fp', 'fn', 'tn', 'evaluated_module_cnt'], 'Value': [final_score, f1, precision, recall, tp, len(pred_pos), len(true_pos), avg_lead_score, avg_lead_hour, min_lead_score, min_lead_hour, int(detail_df['hit'].sum()), accuracy, tp, fp, fn, tn, len(detail_df)]})
+    afws = f1 + avg_lead_score + accuracy
+    summary_df = pd.DataFrame({'Item': ['afws', 'f1_score', 'precision', 'recall', 'all_hit_cnt', 'all_predict_pos_cnt', 'all_true_pos_cnt', 'avg_lead_score', 'avg_lead_hour', 'lead_pread_cnt', 'accuracy', 'tp', 'fp', 'fn', 'tn', 'evaluated_module_cnt'], 'Value': [afws, f1, precision, recall, tp, len(pred_pos), len(true_pos), avg_lead_score, avg_lead_hour, int(detail_df['hit'].sum()), accuracy, tp, fp, fn, tn, len(detail_df)]})
     return (summary_df, detail_df)
 
 def parse_args() -> argparse.Namespace:

@@ -1,1 +1,0 @@
-"""FITS OFP official adapter."""

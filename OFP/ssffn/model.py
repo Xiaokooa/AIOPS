@@ -3,16 +3,15 @@ import torch
 from torch import nn
 from ._engine.embeddings import (SENSORS, SensorDistribution, SensorMeasurementEmbedding,
                                  ProjectionInitializer, StatisticalFeatureEmbedding)
-from ._engine.data import CompatCfg, compat_feature_names
-from ._engine.feature_schema import select_feature_names
+
+from ._engine.feature_schema import STATISTIC_NAMES as _STATISTIC_NAMES
 
 VARIANTS=('full','no_sensor','no_statistics','no_sit','no_hss')
 
 def cached_statistic_names():
-    names=compat_feature_names(CompatCfg(feature_mode='ofp',preserve_timepoints=True))
-    return [n for n in select_feature_names(names,'statistical,expert') if n not in {*SENSORS,'DeltaSeconds','Ts'}]
+    return list(_STATISTIC_NAMES)
 
-STATISTIC_NAMES=tuple(n for n in cached_statistic_names() if n.startswith('Fe'))
+STATISTIC_NAMES=tuple(_STATISTIC_NAMES)
 
 class SSFFNModel(nn.Module):
     def __init__(self,module_variant='full',seq_len=32,stat_feature_names=None,stat_modality_dropout=.15,**unused):
@@ -45,14 +44,14 @@ class SSFFNModel(nn.Module):
             del self.backbone
             del self.module_token
         groups=self.statistical_input.groups if module_variant!='no_statistics' else {}
-        self.temporal_encoder_cfg=dict(architecture='SSFFN',width=64,
+        self.model_config=dict(architecture='SSFFN',width=64,
             depth=0 if module_variant=='no_sit' else 3,heads=4,feedforward=192,dropout=.15,
             sensor_tokens=0 if module_variant=='no_sensor' else 12,
             statistical_tokens=len(groups),module_tokens=0 if module_variant=='no_sit' else 1,
             active_statistic_features=sum(len(ids) for ids in groups.values()),
             statistical_groups={k:[names[i] for i in ids] for k,ids in groups.items()},
             token_feature_dimensions=[len(ids) for ids in groups.values()])
-        cfg=self.temporal_encoder_cfg
+        cfg=self.model_config
         cfg['total_tokens']=cfg['sensor_tokens']+cfg['statistical_tokens']+cfg['module_tokens']
 
     def input_tokens(self,raw_x,raw_mask,stat_x):
@@ -92,12 +91,8 @@ class SSFFN(nn.Module):
     def __init__(self,variant='full'):
         super().__init__()
         self.network=build_model(variant)
-        names=cached_statistic_names()
-        self.register_buffer('active_indices',torch.tensor([names.index(n) for n in STATISTIC_NAMES]))
     def forward(self,current_sensors,statistics):
         if current_sensors.ndim!=2 or current_sensors.shape[1]!=12: raise ValueError('Expected sensors [batch,12]')
         if statistics.shape!=(len(current_sensors),80): raise ValueError('Expected statistics [batch,80]')
         raw=torch.cat([current_sensors,current_sensors.new_zeros(len(current_sensors),1)],1)[:,None]
-        cached=statistics.new_zeros(len(statistics),160)
-        cached[:,self.active_indices]=statistics
-        return self.network(raw,torch.ones_like(raw),cached)
+        return self.network(raw,torch.ones_like(raw),statistics)

@@ -22,21 +22,20 @@ class ModelContract(unittest.TestCase):
         torch.manual_seed(43)
         model = build_model()
         self.assertEqual(sum(p.numel() for p in model.parameters()), 133057)
-        self.assertEqual(model.temporal_encoder_cfg['total_tokens'], 16)
-        self.assertEqual(model.temporal_encoder_cfg['token_feature_dimensions'], [36,36,8])
+        self.assertEqual(model.model_config['total_tokens'], 16)
+        self.assertEqual(model.model_config['token_feature_dimensions'], [36,36,8])
         self.assertEqual(len(STATISTIC_NAMES), 80)
         self.assertEqual(len(set(STATISTIC_NAMES)), 80)
         self.assertEqual(len(model.backbone), 3)
         self.assertFalse(hasattr(model.sensor_input, 'history_projection'))
 
-    def test_inactive_features_and_removals(self):
-        raw, mask, stats = torch.randn(2,32,13), torch.ones(2,32,13), torch.randn(2,160)
-        inactive = [i for i,n in enumerate(cached_statistic_names()) if not n.startswith('Fe')]
+    def test_feature_dimensions_and_branch_removals(self):
+        raw, mask, stats = torch.randn(2,32,13), torch.ones(2,32,13), torch.randn(2,80)
+        self.assertEqual(cached_statistic_names(),list(STATISTIC_NAMES))
         for variant in VARIANTS:
             with self.subTest(variant=variant):
                 model = build_model(variant).eval()
                 changed = stats.clone()
-                changed[:, inactive] += 1000
                 expected = model(raw, mask, stats)
                 torch.testing.assert_close(expected, model(raw, mask, changed), rtol=0, atol=0)
                 # The SMB uses the current measurement only.
@@ -58,15 +57,13 @@ class ModelContract(unittest.TestCase):
         model = SSFFN().eval()
         sensor, stats = torch.randn(2,12), torch.randn(2,80)
         raw = torch.cat((sensor, torch.zeros(2,1)), 1)[:, None]
-        cache = torch.zeros(2,160)
-        cache[:, model.active_indices] = stats
-        torch.testing.assert_close(model(sensor, stats), model.network(raw, torch.ones_like(raw), cache))
+        torch.testing.assert_close(model(sensor, stats), model.network(raw, torch.ones_like(raw), stats))
 
     def test_rule_free_sampling_signal(self):
-        names = engine.compat_feature_names(engine.CompatCfg(feature_mode='ofp', preserve_timepoints=True))
+        names = engine.get_feature_names(engine.TrainingConfig(feature_mode='ofp', preserve_timepoints=True))
         x = np.random.default_rng(0).normal(size=(30,len(names))).astype(np.float32)
         before = sensor_distribution_signal(x, np.zeros(30), names)
-        raw, _, _, _ = engine.feature_indices(names, 'ofp_expert_stat', 'statistical,expert')
+        raw, _, _, _ = engine.feature_indices(names, 'statistics', 'statistical')
         changed = x.copy()
         changed[:, [i for i in range(len(names)) if i not in raw[:12]]] += 500
         np.testing.assert_array_equal(before, sensor_distribution_signal(changed, np.ones(30), names))
@@ -78,8 +75,10 @@ class ModelContract(unittest.TestCase):
             data_dir, _ = generate_data(Path(tmp)/'sample')
             name = 'synthetic_001.csv'
             raw = pd.read_csv(data_dir/name)
-            cfg = engine.CompatCfg(feature_mode='ofp', preserve_timepoints=True, rule_mode='none', target_mode='pre_event')
+            cfg = engine.TrainingConfig(feature_mode='ofp', preserve_timepoints=True, rule_mode='none', target_mode='pre_event')
             full = _read_feature_parts(data_dir, name, cfg, {name:1})[0]
+            self.assertFalse(any(n.startswith(('Ru','Ma')) for n in full.columns))
+            self.assertEqual(len([n for n in full.columns if n.startswith('Fe')]),80)
             active = [*engine.RAW_SEQUENCE_FEATURES[:12], *STATISTIC_NAMES]
             raw.iloc[:25].to_csv(data_dir/'prefix.csv', index=False)
             prefix = _read_feature_parts(data_dir, 'prefix.csv', cfg, {'prefix.csv':0})[0]
@@ -124,6 +123,50 @@ class EvaluationContract(unittest.TestCase):
         self.assertAlmostEqual(result['AFWS'], 1 + np.tanh(.25))
         with self.assertRaises(ValueError):
             metrics_from_decisions(pd.concat([detail, detail]))
+
+
+    def test_internal_metrics_match_public_afws(self):
+        from OFP.ssffn._engine.data import evaluate_prediction_frames
+        from OFP.ssffn._engine.metrics import evaluate_prediction_folder
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            labels=root/'labels'; labels.mkdir()
+            for name in ('a.csv','b.csv'):
+                pd.DataFrame(dict(timestamp=[0,14400],anomaly=[0,1])).to_csv(labels/name,index=False)
+            scores=[]
+            for i,leads in enumerate(((.25,3.75),(2.,2.))):
+                pred=root/str(i);pred.mkdir()
+                frames={name:pd.DataFrame(dict(timestamp=[14400-lead*3600],predict=[1]))
+                        for name,lead in zip(('a.csv','b.csv'),leads)}
+                for name,frame in frames.items():frame.to_csv(pred/name,index=False)
+                summary,detail=evaluate_prediction_frames(frames,labels)
+                metrics=dict(zip(summary.Item,summary.Value))
+                disk_summary,_=evaluate_prediction_folder(pred,labels)
+                disk=dict(zip(disk_summary.Item,disk_summary.Value))
+                self.assertNotIn('min_lead_score',metrics)
+                self.assertNotIn('final_score',metrics)
+                self.assertAlmostEqual(metrics['afws'],metrics_from_decisions(detail)['AFWS'])
+                self.assertAlmostEqual(metrics['afws'],disk['afws'])
+                scores.append(metrics['afws'])
+            self.assertEqual(scores[0],scores[1])
+
+    def test_threshold_ties_use_afws(self):
+        from unittest.mock import patch
+        from argparse import Namespace
+        from OFP.ssffn._engine.evaluation import select_threshold_for_scores
+        from OFP.ssffn._engine import evaluation
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            frame=pd.DataFrame(dict(timestamp=[0],score=[.7]))
+            # Stale scores deliberately disagree with AFWS; they must not select the threshold.
+            summaries=[pd.DataFrame({'Item':['f1_score','afws','final_score'],
+                                   'Value':[.5,2.,0.]}),
+                       pd.DataFrame({'Item':['f1_score','afws','final_score'],
+                                   'Value':[.5,1.,100.]})]
+            args=Namespace(threshold_grid='.2,.8')
+            with patch.object(evaluation,'evaluate_prediction_frames',side_effect=[(s,pd.DataFrame({'hit':[1]})) for s in summaries]):
+                chosen,_=select_threshold_for_scores({'a.csv':frame},root,root,'test',args)
+            self.assertEqual(chosen,.2)
 
 
 if __name__ == '__main__':

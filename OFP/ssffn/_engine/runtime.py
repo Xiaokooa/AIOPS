@@ -26,7 +26,7 @@ def runtime_device_summary(device: str) -> str:
     return ' '.join(pieces)
 
 def format_metric_summary(metrics: dict[str, float]) -> str:
-    keys = ['final_score', 'f1_score', 'precision', 'recall', 'accuracy', 'tp', 'fp', 'fn', 'tn', 'all_hit_cnt', 'all_predict_pos_cnt', 'all_true_pos_cnt', 'avg_lead_score', 'avg_lead_hour', 'min_lead_score', 'min_lead_hour', 'lead_pread_cnt', 'evaluated_module_cnt']
+    keys = ['afws', 'f1_score', 'precision', 'recall', 'accuracy', 'tp', 'fp', 'fn', 'tn', 'all_hit_cnt', 'all_predict_pos_cnt', 'all_true_pos_cnt', 'avg_lead_score', 'avg_lead_hour', 'lead_pread_cnt', 'evaluated_module_cnt']
     parts: list[str] = []
     for key in keys:
         if key not in metrics:

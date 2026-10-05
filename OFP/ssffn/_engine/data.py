@@ -11,14 +11,14 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 from OFP.ssffn._engine.allocation import allocate_stratified_negative_counts
 from OFP.ssffn._engine.metrics import first_positive_timestamp
-from OFP.ssffn._engine.feature_base import MODEL2_FEATURES, NA_DEFAULT, OFP_BASE_COLUMNS, OFP_NAME_MAP, TEMP_OUTLIER, first_anomaly_ahead_label, first_event_valid_mask, make_model2_features, rolling_corr
-from OFP.ssffn._engine.feature_schema import OFP_ENGINEERED_FEATURES, RULE_FEATURES, add_ofp_expert_stat_features, deduplicate
+from OFP.ssffn._engine.feature_base import NA_DEFAULT, OFP_BASE_COLUMNS, OFP_NAME_MAP, TEMP_OUTLIER, first_anomaly_ahead_label, first_event_valid_mask, rolling_corr
+from OFP.ssffn._engine.feature_schema import STATISTIC_NAMES, add_statistical_features, deduplicate
 FEATURE_CACHE_VERSION = 'ssffn_features'
 
 @dataclass
-class CompatCfg:
-    seq_len: int = 64
-    epochs: int = 8
+class TrainingConfig:
+    seq_len: int = 32
+    epochs: int = 16
     batch_size: int = 256
     lr: float = 0.0003
     weight_decay: float = 0.01
@@ -26,10 +26,10 @@ class CompatCfg:
     negative_ratio: float = 10.0
     pos_weight_cap: float = 20.0
     fixed_threshold: float = 0.5
-    target_mode: str = 'module_fault'
+    target_mode: str = 'pre_event'
     target_horizon_hours: float = 120.0
-    feature_mode: str = 'model2_plus'
-    preserve_timepoints: bool = False
+    feature_mode: str = 'statistics'
+    preserve_timepoints: bool = True
     sampling_mode: str = 'module_balanced'
     positive_windows_per_module: int = 96
     negative_windows_per_faulty_module: int = 24
@@ -38,10 +38,10 @@ class CompatCfg:
     threshold_search: bool = True
     threshold_grid: str = '0.001,0.003,0.005,0.01,0.02,0.03,0.05,0.07,0.10,0.15,0.20,0.25,0.30,0.40,0.50'
     threshold_metric: str = 'f1_score'
-    rule_mode: str = 'model2_simple'
+    rule_mode: str = 'none'
     sample_selection: str = 'random'
     sample_topk_fraction: float = 0.5
-    sample_signal_mode: str = 'expert'
+    sample_signal_mode: str = 'sensor_distribution'
     sample_signal_temporal_fraction: float = 0.5
     temporal_positive_weight: float = 0.0
     temporal_weight_horizon_hours: float = 120.0
@@ -69,105 +69,15 @@ class FeatureNormStats:
 
     def arrays(self) -> tuple[np.ndarray, np.ndarray]:
         return (np.asarray(self.mean, dtype=np.float32), np.maximum(np.asarray(self.std, dtype=np.float32), 1e-06))
-ROLLING_BASE_COLS = ['Temp', 'Curr', 'TxP0', 'RxP0', 'RxP1', 'RxP2', 'RxP3', 'RxP4', 'TxP1', 'TxP2', 'TxP3', 'TxP4', 'FeTxP0-Max', 'FeTxP0-Min', 'FeRxP0-Max', 'FeRxP0-Min']
-ROLL_WINDOWS = (3, 6, 12, 24, 64)
-LANE_PLUS_FEATURES = ['TxLaneRange', 'RxLaneRange', 'TxLaneStd', 'RxLaneStd', 'TxP0MinusLaneMean', 'RxP0MinusLaneMean']
-ROLLING_PLUS_FEATURES = []
-DRAM_PLUS_FEATURES = ['DeltaSeconds', 'ElapsedHours', 'TempInvalidFlag', 'CurrLowFlag', 'TxNegativeCount', 'RxNegativeCount', 'PowerNegativeCount', 'PowerHighCount', 'RuleLikeAbnormalCount', 'AnyRuleLikeAbnormal']
-COMPAT_PLUS_FEATURES = list(MODEL2_FEATURES) + LANE_PLUS_FEATURES + ROLLING_PLUS_FEATURES + DRAM_PLUS_FEATURES
-COMPAT_OFP_FEATURES = deduplicate([*MODEL2_FEATURES, *OFP_ENGINEERED_FEATURES])
-COMPAT_OFP_PLUS_FEATURES = deduplicate([*COMPAT_OFP_FEATURES, *LANE_PLUS_FEATURES, *ROLLING_PLUS_FEATURES, *DRAM_PLUS_FEATURES])
 RAW_SENSOR_FEATURES = [name for name in OFP_BASE_COLUMNS if name != 'Ts']
 RAW_VALID_MASK_FEATURES = [f'{name}ValidMask' for name in RAW_SENSOR_FEATURES]
-SSFFN_TIME_FEATURES = ['DeltaSeconds', 'DeltaSecondsValidMask', 'TsValidMask']
-SSFFN_EXPERT_QUALITY_FEATURES = ['TempInvalidFlag', 'AnySensorMissingFlag', 'SensorMissingCount', 'SamplingGapFlag']
-SSFFN_PRESERVED_FEATURES = [*SSFFN_TIME_FEATURES, *RAW_VALID_MASK_FEATURES, *SSFFN_EXPERT_QUALITY_FEATURES]
 
-def compat_feature_names(cfg: CompatCfg) -> list[str]:
-    mode = str(cfg.feature_mode).lower()
-    if mode in {'model2', 'base'}:
-        names = list(MODEL2_FEATURES)
-    elif mode in {'model2_plus', 'plus'}:
-        names = list(COMPAT_PLUS_FEATURES)
-    elif mode in {'ofp', 'ofp_expert_stat'}:
-        names = list(COMPAT_OFP_FEATURES)
-    elif mode in {'ofp_plus', 'ofp_expert_stat_plus'}:
-        names = list(COMPAT_OFP_PLUS_FEATURES)
-    else:
-        raise ValueError(f'Unknown feature_mode={cfg.feature_mode!r}')
-    if bool(cfg.preserve_timepoints):
-        names = deduplicate([*names, *SSFFN_PRESERVED_FEATURES])
-    return names
+def get_feature_names(cfg):
+    return ['Ts',*RAW_SENSOR_FEATURES,*STATISTIC_NAMES,'TsDelta','DeltaSeconds',
+            'DeltaSecondsValidMask','TsValidMask',*RAW_VALID_MASK_FEATURES]
 
-def add_model2_plus_features(frame: pd.DataFrame) -> pd.DataFrame:
-    out = frame.copy()
-    extras: dict[str, object] = {}
-    tx_cols = ['TxP1', 'TxP2', 'TxP3', 'TxP4']
-    rx_cols = ['RxP1', 'RxP2', 'RxP3', 'RxP4']
-    tx = out[tx_cols].apply(pd.to_numeric, errors='coerce') if set(tx_cols) <= set(out.columns) else pd.DataFrame(index=out.index)
-    rx = out[rx_cols].apply(pd.to_numeric, errors='coerce') if set(rx_cols) <= set(out.columns) else pd.DataFrame(index=out.index)
-    if len(tx.columns):
-        extras['TxLaneRange'] = tx.max(axis=1) - tx.min(axis=1)
-        extras['TxLaneStd'] = tx.std(axis=1).fillna(0.0)
-        extras['TxP0MinusLaneMean'] = pd.to_numeric(out.get('TxP0', 0.0), errors='coerce') - tx.mean(axis=1)
-    else:
-        extras['TxLaneRange'] = 0.0
-        extras['TxLaneStd'] = 0.0
-        extras['TxP0MinusLaneMean'] = 0.0
-    if len(rx.columns):
-        extras['RxLaneRange'] = rx.max(axis=1) - rx.min(axis=1)
-        extras['RxLaneStd'] = rx.std(axis=1).fillna(0.0)
-        extras['RxP0MinusLaneMean'] = pd.to_numeric(out.get('RxP0', 0.0), errors='coerce') - rx.mean(axis=1)
-    else:
-        extras['RxLaneRange'] = 0.0
-        extras['RxLaneStd'] = 0.0
-        extras['RxP0MinusLaneMean'] = 0.0
-    ts = pd.to_numeric(out.get('Ts', pd.Series(np.arange(len(out)), index=out.index)), errors='coerce').ffill().fillna(0.0)
-    extras['DeltaSeconds'] = ts.diff().fillna(0.0).clip(lower=0.0)
-    extras['ElapsedHours'] = ((ts - ts.iloc[0]) / 3600.0).fillna(0.0) if len(ts) else 0.0
-    temp = pd.to_numeric(out.get('Temp', 0.0), errors='coerce').fillna(NA_DEFAULT)
-    curr = pd.to_numeric(out.get('Curr', 0.0), errors='coerce').fillna(NA_DEFAULT)
-    extras['TempInvalidFlag'] = temp.le(-254.0).astype(float)
-    extras['CurrLowFlag'] = curr.lt(5000.0).astype(float)
-    tx_all_cols = ['TxP0', 'TxP1', 'TxP2', 'TxP3', 'TxP4']
-    rx_all_cols = ['RxP0', 'RxP1', 'RxP2', 'RxP3', 'RxP4']
-    tx_all = out[[c for c in tx_all_cols if c in out.columns]].apply(pd.to_numeric, errors='coerce')
-    rx_all = out[[c for c in rx_all_cols if c in out.columns]].apply(pd.to_numeric, errors='coerce')
-    tx_neg = tx_all.lt(0.0).sum(axis=1) if len(tx_all.columns) else pd.Series(0.0, index=out.index)
-    rx_neg = rx_all.lt(0.0).sum(axis=1) if len(rx_all.columns) else pd.Series(0.0, index=out.index)
-    tx_high = tx_all.gt(1000.0).sum(axis=1) if len(tx_all.columns) else pd.Series(0.0, index=out.index)
-    rx_high = rx_all.gt(1000.0).sum(axis=1) if len(rx_all.columns) else pd.Series(0.0, index=out.index)
-    power_neg = tx_neg + rx_neg
-    power_high = tx_high + rx_high
-    rule_like = extras['TempInvalidFlag'] + extras['CurrLowFlag'] + power_neg + power_high
-    extras['TxNegativeCount'] = tx_neg.astype(float)
-    extras['RxNegativeCount'] = rx_neg.astype(float)
-    extras['PowerNegativeCount'] = power_neg.astype(float)
-    extras['PowerHighCount'] = power_high.astype(float)
-    extras['RuleLikeAbnormalCount'] = rule_like.astype(float)
-    extras['AnyRuleLikeAbnormal'] = pd.Series(rule_like, index=out.index).gt(0).astype(float)
-    for win in ROLL_WINDOWS:
-        abnormal_roll = pd.Series(rule_like, index=out.index).rolling(window=win, min_periods=1)
-        power_neg_roll = pd.Series(power_neg, index=out.index).rolling(window=win, min_periods=1)
-        power_high_roll = pd.Series(power_high, index=out.index).rolling(window=win, min_periods=1)
-        extras[f'RuleLikeStorm_r{win}'] = abnormal_roll.sum().fillna(0.0)
-        extras[f'RuleLikeRate_r{win}'] = abnormal_roll.mean().fillna(0.0)
-        extras[f'PowerNegStorm_r{win}'] = power_neg_roll.sum().fillna(0.0)
-        extras[f'PowerHighStorm_r{win}'] = power_high_roll.sum().fillna(0.0)
-    for col in ROLLING_BASE_COLS:
-        series = pd.to_numeric(out[col], errors='coerce') if col in out.columns else pd.Series(0.0, index=out.index)
-        extras[f'{col}_d1'] = series.diff().fillna(0.0)
-        extras[f'{col}_exp_range'] = (series.expanding().max() - series.expanding().min()).fillna(0.0)
-        for win in ROLL_WINDOWS:
-            roll = series.rolling(window=win, min_periods=1)
-            mean = roll.mean()
-            extras[f'{col}_r{win}_mean'] = mean
-            extras[f'{col}_r{win}_std'] = roll.std().fillna(0.0)
-            extras[f'{col}_r{win}_delta'] = series - mean
-    return pd.concat([out, pd.DataFrame(extras, index=out.index)], axis=1)
-
-def _clean_features(frame: pd.DataFrame, cfg: CompatCfg) -> np.ndarray:
-    names = compat_feature_names(cfg)
+def _clean_features(frame: pd.DataFrame, cfg: TrainingConfig) -> np.ndarray:
+    names = get_feature_names(cfg)
     for name in names:
         if name not in frame.columns:
             frame[name] = NA_DEFAULT
@@ -182,7 +92,6 @@ def make_features(raw_df: pd.DataFrame, with_label: bool=True) -> tuple[pd.DataF
     ts = raw_ts.where(ts_valid).ffill().fillna(0.0).astype(float)
     out['Ts'] = ts
     out['TsValidMask'] = ts_valid.astype(np.float32)
-    sensor_missing = pd.Series(0.0, index=renamed.index, dtype=float)
     for name in RAW_SENSOR_FEATURES:
         source = pd.to_numeric(renamed.get(name, pd.Series(np.nan, index=renamed.index)), errors='coerce')
         source_values = source.to_numpy(dtype=float)
@@ -192,20 +101,12 @@ def make_features(raw_df: pd.DataFrame, with_label: bool=True) -> tuple[pd.DataF
         valid_series = pd.Series(valid, index=renamed.index)
         out[name] = source.where(valid_series).ffill().fillna(0.0).astype(float)
         out[f'{name}ValidMask'] = valid_series.astype(np.float32)
-        sensor_missing += (~valid_series).astype(float)
     raw_delta = raw_ts.diff()
     delta_valid = ts_valid & ts_valid.shift(1, fill_value=False) & raw_delta.ge(0.0)
     delta_seconds = raw_delta.where(delta_valid, 0.0).fillna(0.0).clip(lower=0.0)
-    positive_delta = delta_seconds[delta_seconds > 0.0]
-    nominal_delta = float(positive_delta.median()) if len(positive_delta) else 0.0
-    gap_threshold = nominal_delta * 1.5 if nominal_delta > 0.0 else float('inf')
     out['DeltaSeconds'] = delta_seconds.astype(float)
     out['DeltaSecondsValidMask'] = delta_valid.astype(np.float32)
     out['TsDelta'] = delta_seconds.astype(float)
-    out['SamplingGapFlag'] = delta_seconds.gt(gap_threshold).astype(np.float32)
-    out['SensorMissingCount'] = sensor_missing.astype(np.float32)
-    out['AnySensorMissingFlag'] = sensor_missing.gt(0.0).astype(np.float32)
-    out['TempInvalidFlag'] = (out['TempValidMask'] <= 0.0).astype(np.float32)
     out['FeCoCurrTemp'] = rolling_corr(out['Curr'], out['Temp'], fill=99.0)
     out['FeCoCurrTxP0'] = rolling_corr(out['Curr'], out['TxP0'], fill=-99.0)
     out['FeCoCurrRxP0'] = rolling_corr(out['Curr'], out['RxP0'], fill=-99.0)
@@ -224,31 +125,9 @@ def make_features(raw_df: pd.DataFrame, with_label: bool=True) -> tuple[pd.DataF
 def _module_label(file_name: str, label_by_file: dict[str, int]) -> int:
     return int(label_by_file.get(file_name, 0))
 
-def _normal_rule_predict(frame: pd.DataFrame, rule_mode: str) -> np.ndarray:
-    mode = str(rule_mode).lower()
-    if mode in {'none', 'off', 'false', '0', 'temp'} or len(frame) == 0:
-        return np.zeros(len(frame), dtype=np.int8)
-    if mode == 'ofp_rules':
-        available = [name for name in RULE_FEATURES if name in frame.columns]
-        if not available:
-            raise ValueError("rule_mode='ofp_rules' requires feature_mode='ofp' or 'ofp_plus'")
-        values = frame[available].apply(pd.to_numeric, errors='coerce').fillna(0.0)
-        return values.gt(0.0).any(axis=1).astype(np.int8).to_numpy()
-    if mode != 'model2_simple':
-        raise ValueError(f'Unknown rule_mode={rule_mode!r}')
-    temp = pd.to_numeric(frame.get('Temp', 0.0), errors='coerce').fillna(NA_DEFAULT)
-    curr = pd.to_numeric(frame.get('Curr', 0.0), errors='coerce').fillna(NA_DEFAULT)
-    tx_min = pd.to_numeric(frame.get('FeTxP0-Min', 0.0), errors='coerce').fillna(0.0)
-    rx_min = pd.to_numeric(frame.get('FeRxP0-Min', 0.0), errors='coerce').fillna(0.0)
-    tx_max = pd.to_numeric(frame.get('FeTxP0-Max', 0.0), errors='coerce').fillna(0.0)
-    rx_max = pd.to_numeric(frame.get('FeRxP0-Max', 0.0), errors='coerce').fillna(0.0)
-    pred = (temp < 0.0) | (curr < 5000.0) | (temp.expanding().max() - temp.expanding().min() > 100.0) | (curr.expanding().max() - curr.expanding().min() > 6000.0) | temp.expanding().std().fillna(0).gt(10.0) | curr.expanding().std().fillna(0).gt(1500.0) | (tx_min < 0.0) | (rx_min < 0.0) | (tx_max > 1000.0) | (rx_max > 1000.0)
-    for col in ['TxP0', 'RxP0', 'RxP1', 'RxP2', 'RxP3', 'RxP4', 'TxP1', 'TxP2', 'TxP3', 'TxP4']:
-        if col in frame.columns:
-            pred = pred | pd.to_numeric(frame[col], errors='coerce').fillna(0.0).lt(0.0)
-    return pred.to_numpy(dtype=np.int8)
 
-def _make_targets(raw: pd.DataFrame, normal: pd.DataFrame, raw_idx: np.ndarray, file_name: str, cfg: CompatCfg, label_by_file: dict[str, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+
+def _make_targets(raw: pd.DataFrame, normal: pd.DataFrame, raw_idx: np.ndarray, file_name: str, cfg: TrainingConfig, label_by_file: dict[str, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     raw_timestamps = pd.to_numeric(raw.get('timestamp', pd.Series(np.nan, index=raw.index)), errors='coerce').to_numpy(dtype=float)
     finite_raw = np.isfinite(raw_timestamps)
     finite = finite_raw[raw_idx] if len(raw_idx) else np.zeros(0, dtype=bool)
@@ -278,29 +157,22 @@ def _make_targets(raw: pd.DataFrame, normal: pd.DataFrame, raw_idx: np.ndarray, 
         raise ValueError(f'Unknown target_mode={cfg.target_mode!r}; use pre_event, ahead_horizon, ahead120, anomaly, or module_fault')
     return (valid_mask.astype(bool), labels.astype(np.int8), anomaly_labels.astype(np.int8))
 
-def _read_feature_parts(data_dir: Path, file_name: str, cfg: CompatCfg, label_by_file: dict[str, int]) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    raw = pd.read_csv(data_dir / file_name)
-    if bool(cfg.preserve_timepoints):
-        normal, extra = make_features(raw, with_label=True)
-    else:
-        normal, extra = make_model2_features(raw, with_label=True)
-    feature_mode = str(cfg.feature_mode).lower()
-    if feature_mode in {'ofp', 'ofp_expert_stat', 'ofp_plus', 'ofp_expert_stat_plus'}:
-        normal = add_ofp_expert_stat_features(normal)
-    if feature_mode in {'model2_plus', 'plus', 'ofp_plus', 'ofp_expert_stat_plus'}:
-        normal = add_model2_plus_features(normal)
-    raw_idx = normal.index.to_numpy(dtype=int)
-    valid_mask, labels, anomaly_labels = _make_targets(raw, normal, raw_idx, file_name, cfg, label_by_file)
-    rule_pred = _normal_rule_predict(normal, cfg.rule_mode)
-    return (normal, extra, valid_mask.astype(bool), labels.astype(np.int8), anomaly_labels.astype(np.int8), rule_pred)
+def _read_feature_parts(data_dir,file_name,cfg,label_by_file):
+    raw=pd.read_csv(data_dir/file_name)
+    normal,extra=make_features(raw,with_label=True)
+    normal=add_statistical_features(normal)
+    raw_idx=normal.index.to_numpy(dtype=int)
+    valid,labels,anomalies=_make_targets(raw,normal,raw_idx,file_name,cfg,label_by_file)
+    return normal,extra,valid,labels,anomalies,np.zeros(len(normal),dtype=np.int8)
 
-def _module_feature_cache_path(cfg: CompatCfg, file_name: str) -> Path | None:
+
+def _module_feature_cache_path(cfg: TrainingConfig, file_name: str) -> Path | None:
     if not str(cfg.module_cache_dir).strip():
         return None
     namespace = '__'.join([FEATURE_CACHE_VERSION, str(cfg.feature_mode).lower(), str(cfg.target_mode).lower(), f'h{float(cfg.target_horizon_hours):g}', 'preserve' if bool(cfg.preserve_timepoints) else 'drop_timepoints', str(cfg.rule_mode).lower()])
     return Path(cfg.module_cache_dir) / namespace / f'{Path(file_name).stem}.npz'
 
-def _read_feature_arrays(data_dir: Path, file_name: str, cfg: CompatCfg, label_by_file: dict[str, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _read_feature_arrays(data_dir: Path, file_name: str, cfg: TrainingConfig, label_by_file: dict[str, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     cache_path = _module_feature_cache_path(cfg, file_name)
     if cache_path is not None and cache_path.exists():
         try:
@@ -329,8 +201,8 @@ def _read_feature_arrays(data_dir: Path, file_name: str, cfg: CompatCfg, label_b
             temp_path.unlink(missing_ok=True)
     return item
 
-def compute_feature_norm_stats(data_dir: Path, train_files: list[str], cfg: CompatCfg, label_by_file: dict[str, int]) -> FeatureNormStats:
-    feature_names = compat_feature_names(cfg)
+def compute_feature_norm_stats(data_dir: Path, train_files: list[str], cfg: TrainingConfig, label_by_file: dict[str, int]) -> FeatureNormStats:
+    feature_names = get_feature_names(cfg)
     sums = np.zeros(len(feature_names), dtype=np.float64)
     sums_sq = np.zeros(len(feature_names), dtype=np.float64)
     count = 0
@@ -351,9 +223,9 @@ def compute_feature_norm_stats(data_dir: Path, train_files: list[str], cfg: Comp
             var[idx] = 1.0
     return FeatureNormStats(mean=mean.astype(float).tolist(), std=np.sqrt(var).astype(float).tolist(), rows_seen=int(count), files_seen=int(len(train_files)), feature_names=feature_names)
 
-class Model2FeatureCache:
+class FeatureCache:
 
-    def __init__(self, data_dir: Path, mean: np.ndarray, std: np.ndarray, cfg: CompatCfg, label_by_file: dict[str, int]) -> None:
+    def __init__(self, data_dir: Path, mean: np.ndarray, std: np.ndarray, cfg: TrainingConfig, label_by_file: dict[str, int]) -> None:
         self.data_dir = Path(data_dir)
         self.mean = mean.astype(np.float32)
         self.std = np.maximum(std.astype(np.float32), 1e-06)
@@ -392,32 +264,11 @@ def _rank_normalize(values: np.ndarray) -> np.ndarray:
         start = end
     return ranks
 
-def row_signal_scores(features: np.ndarray, rule_pred: np.ndarray, feature_names: list[str] | None=None, mode: str='expert', temporal_fraction: float=0.5) -> np.ndarray:
-    if len(features) == 0:
-        return np.zeros(0, dtype=np.float32)
-    finite = np.nan_to_num(features.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-    expert_score = np.mean(np.abs(finite), axis=1)
-    if len(rule_pred) == len(expert_score):
-        expert_score = expert_score + 5.0 * np.asarray(rule_pred, dtype=np.float32)
-    names = list(feature_names or [])
-    raw_indices = [names.index(name) for name in ROLLING_BASE_COLS[:12] if name in names]
-    temporal_score = np.zeros(len(finite), dtype=np.float32)
-    if raw_indices and len(finite) > 1:
-        raw = finite[:, raw_indices]
-        temporal_score[1:] = np.mean(np.abs(raw[1:] - raw[:-1]), axis=1)
-    resolved = str(mode).lower()
-    if resolved == 'expert':
-        score = expert_score
-    elif resolved in {'temporal', 'temporal_change'}:
-        score = temporal_score
-    elif resolved in {'mixed', 'expert_temporal'}:
-        mix = float(np.clip(temporal_fraction, 0.0, 1.0))
-        score = (1.0 - mix) * _rank_normalize(expert_score) + mix * _rank_normalize(temporal_score)
-    else:
-        raise ValueError(f'Unknown sample_signal_mode={mode!r}; use expert, temporal, or mixed')
-    return np.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+def row_signal_scores(features,rule_pred=None,feature_names=None,mode=None,temporal_fraction=None):
+    from .modules import sensor_distribution_signal
+    return sensor_distribution_signal(features,feature_names=feature_names)
 
-def choose_positions_by_signal(positions: np.ndarray, n_take: int, scores: np.ndarray, cfg: CompatCfg, seed: int) -> np.ndarray:
+def choose_positions_by_signal(positions: np.ndarray, n_take: int, scores: np.ndarray, cfg: TrainingConfig, seed: int) -> np.ndarray:
     positions = np.asarray(positions, dtype=np.int64)
     n_take = int(n_take)
     if n_take <= 0 or len(positions) == 0:
@@ -447,7 +298,7 @@ def choose_positions_by_signal(positions: np.ndarray, n_take: int, scores: np.nd
         return np.sort(chosen).astype(np.int64)
     raise ValueError(f'Unknown sample_selection={cfg.sample_selection!r}; use random, signal_topk, or hybrid')
 
-def temporal_position_weights(timestamps: np.ndarray, labels: np.ndarray, anomaly_labels: np.ndarray, positions: np.ndarray, cfg: CompatCfg) -> np.ndarray:
+def temporal_position_weights(timestamps: np.ndarray, labels: np.ndarray, anomaly_labels: np.ndarray, positions: np.ndarray, cfg: TrainingConfig) -> np.ndarray:
     weights = np.ones(len(positions), dtype=np.float32)
     max_extra = float(cfg.temporal_positive_weight)
     if max_extra <= 0.0 or len(positions) == 0:
@@ -462,13 +313,13 @@ def temporal_position_weights(timestamps: np.ndarray, labels: np.ndarray, anomal
     weights[pos_mask] += (max_extra * proximity[pos_mask]).astype(np.float32)
     return weights.astype(np.float32)
 
-class CompatBatchedDataset(IterableDataset):
+class WindowDataset(IterableDataset):
 
-    def __init__(self, file_names: list[str], cache: Model2FeatureCache, cfg: CompatCfg) -> None:
+    def __init__(self, file_names: list[str], cache: FeatureCache, cfg: TrainingConfig) -> None:
         self.file_names = list(file_names)
         self.cache = cache
         self.cfg = cfg
-        self.feature_names = compat_feature_names(cfg)
+        self.feature_names = get_feature_names(cfg)
         self.selected_positions: list[np.ndarray] = []
         self.selected_labels: list[np.ndarray] = []
         self.selected_weights: list[np.ndarray] = []
@@ -521,7 +372,7 @@ class CompatBatchedDataset(IterableDataset):
             self.pos_rows += int(len(pos))
             self.total_batches += int(math.ceil(len(selected) / max(1, int(cfg.batch_size)))) if len(selected) else 0
         self.total_rows = int(self.pos_rows + self.neg_rows)
-        print(f'[compat dataset] files={len(self.file_names)} source_rows={self.source_total_rows} source_pos={self.source_pos_rows} source_neg={self.source_neg_rows} sampled_rows={self.total_rows} sampled_pos={self.pos_rows} sampled_neg={self.neg_rows} sampling={cfg.sampling_mode} negative_ratio={cfg.negative_ratio} per_module pos={cfg.positive_windows_per_module} faulty_neg={cfg.negative_windows_per_faulty_module} normal_neg={cfg.normal_windows_per_module} selection={cfg.sample_selection} signal={cfg.sample_signal_mode} temporal_mix={cfg.sample_signal_temporal_fraction} temporal_pos_w={cfg.temporal_positive_weight} features={len(self.feature_names)} batches={self.total_batches}')
+        print(f'[training windows] files={len(self.file_names)} source_rows={self.source_total_rows} source_pos={self.source_pos_rows} source_neg={self.source_neg_rows} sampled_rows={self.total_rows} sampled_pos={self.pos_rows} sampled_neg={self.neg_rows} sampling={cfg.sampling_mode} negative_ratio={cfg.negative_ratio} per_module pos={cfg.positive_windows_per_module} faulty_neg={cfg.negative_windows_per_faulty_module} normal_neg={cfg.normal_windows_per_module} selection={cfg.sample_selection} signal={cfg.sample_signal_mode} temporal_mix={cfg.sample_signal_temporal_fraction} temporal_pos_w={cfg.temporal_positive_weight} features={len(self.feature_names)} batches={self.total_batches}')
 
     def __len__(self) -> int:
         return int(self.total_batches)
@@ -621,25 +472,17 @@ def format_epoch_status(tag: str, model_name: str, fold: int | None, epoch: int,
     fold_text = f' fold={fold}' if fold is not None else ''
     return f'[{tag}] model={model_name}{fold_text} ep={epoch:02d}/{total_epochs:02d} {progress_bar(epoch, total_epochs, width=18)} loss={loss:.5f} rows={rows} rate={format_rate(rows, epoch_seconds)} epoch={format_duration(epoch_seconds)} elapsed={format_duration(elapsed_seconds)} eta={format_duration(eta_seconds)}'
 
-def effective_pos_weight(dataset: CompatBatchedDataset, cfg: CompatCfg) -> float:
+def effective_pos_weight(dataset: WindowDataset, cfg: TrainingConfig) -> float:
     value = max(1.0, float(dataset.neg_rows) / max(float(dataset.pos_rows), 1.0))
     if float(cfg.pos_weight_cap) > 0:
         value = min(value, float(cfg.pos_weight_cap))
     return float(value)
 
-def apply_threshold(frame: pd.DataFrame, threshold: float, confirm_k: int=1, confirm_m: int=1) -> pd.DataFrame:
-    out = frame.copy()
-    score = pd.to_numeric(out.get('score'), errors='coerce')
-    deep_hit = (score >= float(threshold)).fillna(False).astype(int)
-    k = max(1, int(confirm_k))
-    m = max(k, int(confirm_m))
-    if k > 1 or m > 1:
-        deep_pred = deep_hit.rolling(window=m, min_periods=k).sum().ge(k).astype(int)
-    else:
-        deep_pred = deep_hit
-    rule_pred = pd.to_numeric(out.get('rule_predict', 0), errors='coerce').fillna(0).astype(int)
-    out['predict'] = ((deep_pred > 0) | (rule_pred > 0)).astype(int)
-    return out[['timestamp', 'predict', 'score', 'rule_predict', 'source']]
+def apply_threshold(frame,threshold,confirm_k=1,confirm_m=1):
+    out=frame.copy()
+    out['predict']=pd.to_numeric(out['score'],errors='coerce').ge(float(threshold)).astype(int)
+    return out[['timestamp','predict','score']]
+
 
 def file_label_map(index_df: pd.DataFrame) -> dict[str, int]:
     return {str(row['file_name']): int(row['Label']) for _, row in index_df[['file_name', 'Label']].drop_duplicates('file_name').iterrows()}
@@ -734,11 +577,9 @@ def evaluate_prediction_frames(prediction_frames: dict[str, pd.DataFrame], label
     median_lead_hour = float(lead_hours.median()) if not lead_hours.empty else 0.0
     p25_lead_hour = float(lead_hours.quantile(0.25)) if not lead_hours.empty else 0.0
     p75_lead_hour = float(lead_hours.quantile(0.75)) if not lead_hours.empty else 0.0
-    min_lead_hour = float(lead_hours.min()) if not lead_hours.empty else 0.0
     avg_lead_score = math.tanh(avg_lead_hour)
-    min_lead_score = math.tanh(min_lead_hour)
-    final_score = f1 + avg_lead_score + min_lead_score + accuracy
-    summary_df = pd.DataFrame({'Item': ['final_score', 'f1_score', 'precision', 'recall', 'all_hit_cnt', 'all_predict_pos_cnt', 'all_true_pos_cnt', 'avg_lead_score', 'avg_lead_hour', 'min_lead_score', 'min_lead_hour', 'lead_pread_cnt', 'accuracy', 'balanced_accuracy', 'specificity', 'false_alarm_rate', 'false_alarms_per_1000_normal', 'predicted_positive_rate', 'recall_all_positive', 'warnable_recall', 'warnable_positive_cnt', 'non_warnable_positive_cnt', 'first_warning_upper_bound', 'median_lead_hour', 'p25_lead_hour', 'p75_lead_hour', 'tp', 'fp', 'fn', 'tn', 'evaluated_module_cnt', 'min_hit_lead_hours'], 'Value': [final_score, f1, precision, recall, tp, len(pred_pos), len(true_pos), avg_lead_score, avg_lead_hour, min_lead_score, min_lead_hour, int(detail_df['hit'].sum()), accuracy, balanced_accuracy, specificity, false_alarm_rate, false_alarms_per_1000_normal, predicted_positive_rate, recall, warnable_recall, warnable_positive_cnt, non_warnable_positive_cnt, first_warning_upper_bound, median_lead_hour, p25_lead_hour, p75_lead_hour, tp, fp, fn, tn, len(detail_df), float(min_hit_lead_hours)]})
+    afws = f1 + avg_lead_score + accuracy
+    summary_df = pd.DataFrame({'Item': ['afws', 'f1_score', 'precision', 'recall', 'all_hit_cnt', 'all_predict_pos_cnt', 'all_true_pos_cnt', 'avg_lead_score', 'avg_lead_hour', 'lead_pread_cnt', 'accuracy', 'balanced_accuracy', 'specificity', 'false_alarm_rate', 'false_alarms_per_1000_normal', 'predicted_positive_rate', 'recall_all_positive', 'warnable_recall', 'warnable_positive_cnt', 'non_warnable_positive_cnt', 'first_warning_upper_bound', 'median_lead_hour', 'p25_lead_hour', 'p75_lead_hour', 'tp', 'fp', 'fn', 'tn', 'evaluated_module_cnt', 'min_hit_lead_hours'], 'Value': [afws, f1, precision, recall, tp, len(pred_pos), len(true_pos), avg_lead_score, avg_lead_hour, int(detail_df['hit'].sum()), accuracy, balanced_accuracy, specificity, false_alarm_rate, false_alarms_per_1000_normal, predicted_positive_rate, recall, warnable_recall, warnable_positive_cnt, non_warnable_positive_cnt, first_warning_upper_bound, median_lead_hour, p25_lead_hour, p75_lead_hour, tp, fp, fn, tn, len(detail_df), float(min_hit_lead_hours)]})
     return (summary_df, detail_df)
 
 def evaluate_prediction_dir_compat(prediction_dir: Path, label_dir: Path, predict_column: str='predict', min_hit_lead_hours: float=0.0) -> tuple[pd.DataFrame, pd.DataFrame]:

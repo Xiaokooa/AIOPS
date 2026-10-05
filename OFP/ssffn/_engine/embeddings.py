@@ -34,13 +34,11 @@ class SensorMeasurementEmbedding(SensorDistribution):
 class ProjectionInitializer(nn.Module):
     def __init__(self,names):
         super().__init__()
-        self.groups=OrderedDict(continuous=[],indicators=[])
-        for i,name in enumerate(names):
-            flag=name.startswith('Ru') or name.endswith(('InvalidFlag','MissingFlag','GapFlag')) or 'MissingCount' in name
-            self.groups['indicators' if flag else 'continuous'].append(i)
-        self.projections=nn.ModuleList([nn.Linear(len(ids),64) for ids in self.groups.values()])
+        # Fixed initialization pools preserve the declared seed schedule.
+        self.projections=nn.ModuleList([nn.Linear(118,64),nn.Linear(42,64)])
         self.identity=nn.Parameter(torch.empty(1,2,64))
         nn.init.normal_(self.identity,std=.02)
+
 
 class StatisticalFeatureEmbedding(nn.Module):
     def __init__(self,names,initializer):
@@ -57,7 +55,7 @@ class StatisticalFeatureEmbedding(nn.Module):
             layer=nn.Linear(len(indices),64)
             token=1 if group=='relations' else 0
             with torch.no_grad():
-                columns=[initializer.groups['continuous'].index(i) for i in indices]
+                columns=indices
                 layer.weight.copy_(initializer.projections[0].weight[:,columns])
                 layer.bias.copy_(initializer.projections[token].bias)
             self.projections.append(layer)

@@ -18,7 +18,7 @@ def position_digest(dataset):
     return h.hexdigest()
 
 def start_policy(dataset):
-    return dict(bootstrap_signal='mean absolute asinh of training-standardized 12 sensor values', bootstrap_positions_sha256=position_digest(dataset), bootstrap_selection='hybrid half sensor deviation, half random; original class quotas', excluded_sampling_inputs='All engineered features, Ma/Ru, quality flags and rule predictions', rule_signal_used=False, normal_quota=8, training_modules=len(dataset.file_names))
+    return dict(bootstrap_signal='mean absolute asinh of training-standardized 12 sensor values', bootstrap_positions_sha256=position_digest(dataset), bootstrap_selection='hybrid half sensor deviation, half random; original class quotas', rule_signal_used=False, normal_quota=8, training_modules=len(dataset.file_names))
 
 class UniformNormalSampler:
 

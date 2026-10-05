@@ -1,8 +1,0 @@
-# Install PyTorch separately for the server CUDA/driver version.
-numpy
-pandas
-scikit-learn
-xgboost
-tqdm
-psutil
-matplotlib

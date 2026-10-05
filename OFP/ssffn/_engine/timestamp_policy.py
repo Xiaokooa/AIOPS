@@ -10,4 +10,4 @@ def preserve_timestamps(raw_df, with_label=True):
 
 def install_timestamp_policy():
     deep.make_features = preserve_timestamps
-    deep.FEATURE_CACHE_VERSION = 'ssffn_features_float32'
+    deep.FEATURE_CACHE_VERSION = 'ssffn_statistics80_float32'
